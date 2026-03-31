@@ -1,0 +1,48 @@
+{
+  "chatgpt": {
+    "label": "OpenAI ChatGPT",
+    "baseUrl": "https://chatgpt.com/",
+    "loginUrl": "https://chatgpt.com/auth/login",
+    "readySelectors": ["#prompt-textarea", "textarea", "[contenteditable='true']", "[data-testid='composer-text-input']"],
+    "inputSelector": "#prompt-textarea",
+    "submitSelector": "button[data-testid='send-button']",
+    "messageSelectors": ["article [data-message-author-role='assistant']", "[data-message-author-role='assistant']"],
+    "busySelectors": ["button[data-testid='stop-button']"]
+  },
+  "claude": {
+    "label": "Anthropic Claude",
+    "baseUrl": "https://claude.ai/new",
+    "loginUrl": "https://claude.ai/login",
+    "readySelectors": [
+      "div[data-testid='chat-input'][contenteditable='true']",
+      "div[contenteditable='true'][data-testid='chat-input']",
+      "div[contenteditable='true']"
+    ],
+    "inputSelector": "div[data-testid='chat-input'][contenteditable='true']",
+    "messageSelectors": [
+      "div[data-is-streaming] .font-claude-response .standard-markdown",
+      "div[data-is-streaming] .font-claude-response",
+      ".font-claude-response .standard-markdown",
+      ".font-claude-response"
+    ],
+    "busySelectors": ["div[data-is-streaming='true']", "button[aria-label*='Stop']"]
+  },
+  "gemini": {
+    "label": "Google Gemini",
+    "baseUrl": "https://gemini.google.com/app",
+    "readySelectors": ["div[contenteditable='true']", "textarea", "rich-textarea div[contenteditable='true']"],
+    "inputSelector": "rich-textarea div[contenteditable='true']",
+    "submitSelector": "button[aria-label*='Send']",
+    "messageSelectors": ["message-content", ".model-response-text", "response-container"],
+    "busySelectors": ["button[aria-label*='Stop']"]
+  },
+  "grok": {
+    "label": "xAI Grok",
+    "baseUrl": "https://grok.com/",
+    "readySelectors": ["textarea", "div[contenteditable='true']"],
+    "inputSelector": "textarea",
+    "submitSelector": "button[type='submit']",
+    "messageSelectors": ["[data-testid='message-assistant']", "main article", "main div[class*='prose']"],
+    "busySelectors": ["button[aria-label*='Stop']"]
+  }
+}

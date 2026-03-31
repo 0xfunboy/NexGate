@@ -1,0 +1,18 @@
+{
+  "chatgpt": [
+    { "email": "primary@gmail.com", "profileDir": "_shared" },
+    { "email": "backup@gmail.com",  "profileDir": "chatgpt-backup-1" }
+  ],
+  "claude": [
+    { "email": "primary@gmail.com", "profileDir": "_shared" },
+    { "email": "backup@gmail.com",  "profileDir": "claude-backup-1" }
+  ],
+  "gemini": [
+    { "email": "primary@gmail.com", "profileDir": "_shared" },
+    { "email": "backup@gmail.com",  "profileDir": "gemini-backup-1" }
+  ],
+  "grok": [
+    { "email": "primary@gmail.com", "profileDir": "_shared" },
+    { "email": "backup@gmail.com",  "profileDir": "grok-backup-1" }
+  ]
+}
