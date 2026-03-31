@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="it">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -28,12 +28,16 @@
         <span class="top-stat top-time" id="stat-time">--:--:--</span>
       </div>
       <div class="topbar-right">
-        <button class="topbar-btn" id="refresh-status" title="Aggiorna stato (R)">
+        <div class="lang-switch" id="lang-switch" aria-label="Language switcher">
+          <button class="lang-btn" id="lang-it" title="Italiano" aria-label="Italiano">ITA</button>
+          <button class="lang-btn" id="lang-en" title="English" aria-label="English">ENG</button>
+        </div>
+        <button class="topbar-btn" id="refresh-status" title="Refresh status (R)">
           <svg viewBox="0 0 16 16" fill="none">
             <path d="M13.5 8A5.5 5.5 0 1 1 8 2.5M13.5 2v3.5H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
-        <button class="topbar-btn" id="help-btn" title="Scorciatoie (?)">
+        <button class="topbar-btn" id="help-btn" title="Shortcuts (?)">
           <svg viewBox="0 0 16 16" fill="none">
             <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.5"/>
             <path d="M8 11.5V12M5.5 6a2.5 2.5 0 0 1 5 0c0 1.5-2.5 2-2.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
@@ -48,7 +52,7 @@
       <!-- SIDEBAR -->
       <aside class="sidebar">
         <div class="sidebar-header">
-          <span>PROVIDER SESSIONS</span>
+          <span id="sidebar-header-text">PROVIDER SESSIONS</span>
         </div>
         <div id="providers-list" class="providers-list"></div>
         <div id="global-error" class="global-error hidden"></div>
@@ -60,14 +64,14 @@
         <!-- PROMPT -->
         <section class="prompt-section">
           <div class="section-header">
-            <span class="section-label">PROMPT LAB</span>
-            <span class="section-hint" id="prompt-hint">Seleziona provider · Ctrl+Enter per avviare</span>
+            <span class="section-label" id="prompt-section-label">PROMPT LAB</span>
+            <span class="section-hint" id="prompt-hint">Select providers · Ctrl+Enter to run</span>
           </div>
           <div class="prompt-body">
             <div class="prompt-field-wrap">
               <textarea
                 id="prompt-input"
-                placeholder="Scrivi il prompt da inviare ai provider selezionati…"
+                placeholder="Write the prompt to send to the selected providers…"
                 rows="4"
                 spellcheck="false"
                 autocomplete="off"
@@ -79,7 +83,7 @@
               <div id="provider-picker" class="provider-picker"></div>
               <button id="run-compare" class="run-btn">
                 <span class="run-icon">▶</span>
-                <span>CONFRONTA</span>
+                <span id="run-label">COMPARE</span>
                 <kbd>⌃↵</kbd>
               </button>
             </div>
@@ -90,13 +94,13 @@
         <!-- COMPARE VIEW -->
         <section class="compare-section">
           <div class="section-header">
-            <span class="section-label">COMPARE VIEW</span>
+            <span class="section-label" id="compare-section-label">COMPARE VIEW</span>
             <span class="compare-meta" id="compare-meta"></span>
           </div>
           <div id="results-grid" class="results-grid">
             <div class="empty-state">
               <div class="empty-glyph">◈</div>
-              <p>Nessun confronto. Completa il login dei provider, inserisci un prompt e premi CONFRONTA.</p>
+              <p id="empty-state-text">No comparison yet. Complete provider login, enter a prompt, and press COMPARE.</p>
             </div>
           </div>
         </section>
@@ -108,17 +112,17 @@
     <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
 
     <!-- HELP OVERLAY -->
-    <div id="help-overlay" class="help-overlay hidden" role="dialog" aria-modal="true" aria-label="Scorciatoie da tastiera">
+    <div id="help-overlay" class="help-overlay hidden" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
       <div class="help-panel">
-        <div class="help-title">SCORCIATOIE DA TASTIERA</div>
+        <div class="help-title" id="help-title">KEYBOARD SHORTCUTS</div>
         <table class="help-table">
-          <tr><td><kbd>Ctrl+Enter</kbd></td><td>Avvia confronto</td></tr>
-          <tr><td><kbd>R</kbd></td><td>Aggiorna stato provider</td></tr>
-          <tr><td><kbd>1</kbd> – <kbd>4</kbd></td><td>Toggle provider 1–4</td></tr>
-          <tr><td><kbd>Esc</kbd></td><td>Chiudi overlay</td></tr>
-          <tr><td><kbd>?</kbd></td><td>Mostra questa guida</td></tr>
+          <tr><td><kbd>Ctrl+Enter</kbd></td><td id="help-row-run">Run compare</td></tr>
+          <tr><td><kbd>R</kbd></td><td id="help-row-refresh">Refresh provider status</td></tr>
+          <tr><td><kbd>1</kbd> – <kbd>4</kbd></td><td id="help-row-toggle">Toggle provider 1–4</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td id="help-row-close">Close overlay</td></tr>
+          <tr><td><kbd>?</kbd></td><td id="help-row-show">Show this guide</td></tr>
         </table>
-        <button id="help-close" class="help-close">CHIUDI</button>
+        <button id="help-close" class="help-close">CLOSE</button>
       </div>
     </div>
 
