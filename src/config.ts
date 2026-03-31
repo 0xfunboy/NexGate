@@ -31,7 +31,7 @@ const defaultProviders: Record<ProviderId, Omit<ProviderConfig, "id">> = {
     baseUrl: "https://gemini.google.com/app",
     readySelectors: ["div[contenteditable='true']", "textarea", "rich-textarea div[contenteditable='true']"],
     inputSelector: "rich-textarea div[contenteditable='true']",
-    submitSelector: "button[aria-label*='Send']",
+    submitSelector: "button[aria-label*='Send'], button[aria-label*='Run'], button[aria-label*='Submit'], button[mattooltip*='Send'], button[type='submit']",
     messageSelectors: ["message-content", ".model-response-text", "response-container"],
     busySelectors: ["button[aria-label*='Stop']"],
   },

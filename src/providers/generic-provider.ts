@@ -136,6 +136,8 @@ export class GenericFrontendProvider {
       await page.keyboard.type(prompt);
     }
 
+    let attemptedSubmit = false;
+
     if (this.config.submitSelector) {
       const submit = page.locator(this.config.submitSelector).first();
       if (await submit.isVisible().catch(() => false)) {
@@ -151,13 +153,17 @@ export class GenericFrontendProvider {
             await page.keyboard.press("Enter");
           });
         });
-        return;
+        attemptedSubmit = true;
       }
     }
 
-    await input.press("Enter").catch(async () => {
-      await page.keyboard.press("Enter");
-    });
+    if (!attemptedSubmit) {
+      await input.press("Enter").catch(async () => {
+        await page.keyboard.press("Enter");
+      });
+    }
+
+    await this.ensurePromptSubmitted(page, input, prompt);
   }
 
   async *streamResponse(
@@ -167,7 +173,7 @@ export class GenericFrontendProvider {
     const startedAt = Date.now();
     let previous = "";
     let stableTicks = 0;
-    let firstChunkSeen = false;
+    let firstUsefulSignalSeen = false;
 
     while (stableTicks < this.gatewayConfig.streamStableTicks) {
       if (Date.now() - startedAt > this.gatewayConfig.streamMaxDurationMs) {
@@ -175,23 +181,28 @@ export class GenericFrontendProvider {
       }
 
       const current = await this.readLastMessage(page, baseline);
+      const hasImageSignal = await this.hasLastResponseImages(page);
       if (current && current !== previous) {
         const delta = current.startsWith(previous) ? current.slice(previous.length) : "";
         previous = current;
         stableTicks = 0;
         if (delta) {
-          firstChunkSeen = true;
+          firstUsefulSignalSeen = true;
           yield delta;
         }
       }
 
+      if (hasImageSignal) {
+        firstUsefulSignalSeen = true;
+      }
+
       const busy = await this.isBusy(page);
-      const canSettleWhileBusy = firstChunkSeen && ["claude", "gemini"].includes(this.config.id);
+      const canSettleWhileBusy = firstUsefulSignalSeen && ["claude", "gemini"].includes(this.config.id);
       if (!current || current === previous) {
         stableTicks = busy && !canSettleWhileBusy ? 0 : stableTicks + 1;
       }
 
-      if (!firstChunkSeen && Date.now() - startedAt > this.gatewayConfig.streamFirstChunkTimeoutMs) {
+      if (!firstUsefulSignalSeen && Date.now() - startedAt > this.gatewayConfig.streamFirstChunkTimeoutMs) {
         throw new Error(`Provider ${this.config.id} non ha iniziato a rispondere entro il timeout iniziale.`);
       }
 
@@ -355,6 +366,41 @@ export class GenericFrontendProvider {
   private async firstVisibleLocator(page: Page, selectors: string[], timeoutMs: number): Promise<Locator | null> {
     const selector = await this.findFirstVisible(page, selectors, timeoutMs);
     return selector ? page.locator(selector).first() : null;
+  }
+
+  private async ensurePromptSubmitted(page: Page, input: Locator, prompt: string): Promise<void> {
+    if (this.config.id !== "gemini") {
+      return;
+    }
+
+    const normalizedPrompt = prompt.trim();
+    const looksUnsent = async (): Promise<boolean> => {
+      const current = await input
+        .evaluate((element) => {
+          const field = element as {
+            value?: string;
+            textContent?: string | null;
+            innerText?: string;
+          };
+          return (field.value || field.innerText || field.textContent || "").trim();
+        })
+        .catch(() => "");
+
+      return Boolean(current) && current.includes(normalizedPrompt);
+    };
+
+    await sleep(250);
+    if (!(await looksUnsent())) {
+      return;
+    }
+
+    for (const key of ["Control+Enter", "Meta+Enter", "Enter"]) {
+      await page.keyboard.press(key).catch(() => undefined);
+      await sleep(350);
+      if (!(await looksUnsent())) {
+        return;
+      }
+    }
   }
 
   async isReady(page: Page): Promise<boolean> {
@@ -672,23 +718,106 @@ export class GenericFrontendProvider {
   }
 
   private async captureLastResponseImages(page: Page): Promise<GeneratedImage[]> {
+    return this.captureImagesFromSelectors(page, this.getImageSelectors());
+  }
+
+  private async hasLastResponseImages(page: Page): Promise<boolean> {
+    return (await this.countImageCandidates(page, this.getImageSelectors())) > 0;
+  }
+
+  private getImageSelectors(): string[] {
     if (this.config.id === "chatgpt") {
-      return this.readChatGptGeneratedImages(page);
+      return ["[id^='image-'] img[src]", ".group\\/imagegen-image img[src]"];
     }
 
     if (this.config.id === "gemini") {
-      return this.readGeminiGeneratedImages(page);
+      return [".generated-images img[src]", "generated-image img[src]", "single-image img[src]", ".attachment-container img[src]"];
     }
 
     if (this.config.id === "grok") {
-      return this.readGrokGeneratedImages(page);
+      return ["main article img[src]", "[data-testid='message-assistant'] img[src]"];
     }
 
     if (this.config.id === "claude") {
-      return this.readClaudeGeneratedImages(page);
+      return ["[data-is-streaming] img[src]", ".font-claude-response img[src]"];
     }
 
     return [];
+  }
+
+  private async countImageCandidates(page: Page, selectors: string[]): Promise<number> {
+    let total = 0;
+
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      if (count === 0) continue;
+
+      for (let index = Math.max(0, count - 6); index < count; index += 1) {
+        const node = locator.nth(index);
+        const visible = await node.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        const box = await node.boundingBox().catch(() => null);
+        if (!box || box.width < 120 || box.height < 120) continue;
+        total += 1;
+      }
+    }
+
+    return total;
+  }
+
+  private async captureImagesFromSelectors(page: Page, selectors: string[]): Promise<GeneratedImage[]> {
+    const results: GeneratedImage[] = [];
+    const seen = new Set<string>();
+
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      if (count === 0) continue;
+
+      for (let index = Math.max(0, count - 6); index < count; index += 1) {
+        if (results.length >= 4) {
+          return results;
+        }
+
+        const node = locator.nth(index);
+        const visible = await node.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        const box = await node.boundingBox().catch(() => null);
+        if (!box || box.width < 120 || box.height < 120) continue;
+
+        const meta = await node
+          .evaluate((element) => {
+            const image = element as {
+              currentSrc?: string;
+              src?: string;
+              alt?: string;
+            };
+
+            return {
+              src: image.currentSrc || image.src || "",
+              alt: image.alt || "",
+            };
+          })
+          .catch(() => ({ src: "", alt: "" }));
+
+        const dedupeKey = meta.src || `${selector}:${index}:${Math.round(box.width)}x${Math.round(box.height)}`;
+        if (seen.has(dedupeKey)) continue;
+
+        const screenshot = await node.screenshot({ type: "png" }).catch(() => null);
+        if (!screenshot) continue;
+
+        seen.add(dedupeKey);
+        results.push({
+          src: `data:image/png;base64,${screenshot.toString("base64")}`,
+          alt: meta.alt || undefined,
+        });
+      }
+    }
+
+    return results;
   }
 
   private async readChatGptGeneratedImages(page: Page): Promise<GeneratedImage[]> {
@@ -1038,7 +1167,10 @@ export class GenericFrontendProvider {
       cleaned = cleaned.replace(/Gemini Apps Activity[\s\S]*$/i, " ");
       cleaned = cleaned.replace(/^Opens in a new window\s*/i, "");
       cleaned = cleaned.replace(/^Gemini\s*/i, "");
+      cleaned = cleaned.replace(/^Gemini said\s*/i, "");
+      cleaned = cleaned.replace(/^said\s*/i, "");
       cleaned = cleaned.replace(/^You said\s*/i, "");
+      cleaned = cleaned.replace(/^Caricamento di .*$/gim, " ");
       cleaned = cleaned.replace(/Gemini isn[’']t human\.[\s\S]*?double-check it\.\s*/i, "");
       cleaned = cleaned.replace(/Your privacy & Gemini[\s\S]*$/i, " ");
       cleaned = cleaned.replace(/^Ask Gemini 3\s*/i, "");
@@ -1090,6 +1222,8 @@ export class GenericFrontendProvider {
       gemini: new Set([
         "you said",
         "gemini",
+        "gemini said",
+        "said",
         "tools",
         "fast",
         "ask gemini 3",
@@ -1152,6 +1286,10 @@ export class GenericFrontendProvider {
         }
 
         if (this.config.id === "gemini" && (normalized.includes("gemini isn’t human") || normalized.includes("gemini isn't human"))) {
+          return false;
+        }
+
+        if (this.config.id === "gemini" && normalized.startsWith("caricamento di ")) {
           return false;
         }
 
