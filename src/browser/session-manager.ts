@@ -179,11 +179,11 @@ export class SessionManager {
       channel: this.gatewayConfig.browserExecutablePath ? undefined : (this.gatewayConfig.browserChannel ?? "chrome"),
       executablePath: this.gatewayConfig.browserExecutablePath,
       headless: this.gatewayConfig.headless,
-      viewport: null,
+      viewport: { width: 1440, height: 960 },
       locale: "en-US",
       colorScheme: "dark",
       args: [
-        "--start-maximized",
+        "--window-size=1440,960",
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
         "--no-default-browser-check",
