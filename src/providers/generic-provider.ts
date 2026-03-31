@@ -176,7 +176,7 @@ export class GenericFrontendProvider {
 
       const current = await this.readLastMessage(page, baseline);
       if (current && current !== previous) {
-        const delta = current.slice(previous.length);
+        const delta = current.startsWith(previous) ? current.slice(previous.length) : "";
         previous = current;
         stableTicks = 0;
         if (delta) {
@@ -202,6 +202,7 @@ export class GenericFrontendProvider {
       throw new Error(`Provider ${this.config.id} non ha prodotto testo utile in risposta.`);
     }
 
+    previous = await this.finalizeStreamedMessage(page, baseline, previous, startedAt);
     return previous;
   }
 
@@ -280,6 +281,10 @@ export class GenericFrontendProvider {
       if (text) {
         return text;
       }
+    }
+
+    if (!this.shouldUseSelectorFallback()) {
+      return "";
     }
 
     const mainText = await this.readMainText(page);
@@ -439,14 +444,29 @@ export class GenericFrontendProvider {
     }
 
     if (this.config.id === "chatgpt") {
-      return page
-        .locator("[data-message-author-role='assistant'] .markdown, [data-message-author-role='assistant']")
-        .count()
-        .catch(() => 0);
+      return page.locator("[data-message-author-role='assistant']").count().catch(() => 0);
     }
 
     if (this.config.id === "gemini") {
-      return page.locator("response-container message-content, message-content, .model-response-text, response-container").count().catch(() => 0);
+      const count = await page.evaluate((): number => {
+        type DomLike = {
+          querySelectorAll: (selector: string) => unknown[];
+        };
+        type NodeLike = {
+          parentElement?: {
+            closest?: (selector: string) => unknown;
+          } | null;
+        };
+
+        const doc = (globalThis as { document?: DomLike }).document;
+        if (!doc) return 0;
+
+        const all = doc.querySelectorAll("message-content") as NodeLike[];
+        return all.filter((el) => el.parentElement?.closest?.("message-content") === null).length;
+      }).catch(() => 0);
+
+      if (count > 0) return count;
+      return page.locator("response-container").count().catch(() => 0);
     }
 
     if (this.config.id === "grok") {
@@ -647,6 +667,43 @@ export class GenericFrontendProvider {
     }
 
     return "";
+  }
+
+  private async finalizeStreamedMessage(
+    page: Page,
+    baseline: { count: number; lastText: string; mainText: string; prompt?: string },
+    current: string,
+    startedAt: number,
+  ): Promise<string> {
+    let latest = current;
+    let stableReads = 0;
+    const settleDeadline = Math.min(
+      startedAt + this.gatewayConfig.streamMaxDurationMs,
+      Date.now() + Math.max(this.gatewayConfig.streamPollIntervalMs * 4, 2_500),
+    );
+
+    while (Date.now() < settleDeadline) {
+      const next = await this.readLastMessage(page, baseline);
+      if (next && next !== latest) {
+        latest = next;
+        stableReads = 0;
+      } else {
+        stableReads += 1;
+      }
+
+      const busy = await this.isBusy(page);
+      if (!busy && stableReads >= 2) {
+        break;
+      }
+
+      await sleep(Math.min(this.gatewayConfig.streamPollIntervalMs, 700));
+    }
+
+    return latest;
+  }
+
+  private shouldUseSelectorFallback(): boolean {
+    return this.config.id === "grok";
   }
 
   private extractTextDelta(before: string, after: string): string {

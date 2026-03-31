@@ -178,13 +178,9 @@ export class FrontendGateway {
       const baseline = await provider.snapshotConversation(page);
       await provider.sendPrompt(page, prompt);
 
-      let fullText = "";
       try {
-        for await (const chunk of provider.streamResponse(page, { ...baseline, prompt })) {
-          fullText += chunk;
-        }
-
-        const text = fullText.trim();
+        const { finalText } = await this.collectProviderStream(provider.streamResponse(page, { ...baseline, prompt }));
+        const text = finalText.trim();
         if (provider.isQuotaExhausted(text)) {
           throw new QuotaExhaustedError(providerId, activeEmail, text);
         }
@@ -224,14 +220,14 @@ export class FrontendGateway {
       const baseline = await provider.snapshotConversation(page);
       await provider.sendPrompt(page, prompt);
 
-      let fullText = "";
       try {
-        for await (const chunk of provider.streamResponse(page, { ...baseline, prompt })) {
-          fullText += chunk;
-          await handlers.onToken(chunk);
-        }
-
-        const text = fullText.trim();
+        const { finalText } = await this.collectProviderStream(
+          provider.streamResponse(page, { ...baseline, prompt }),
+          async (chunk) => {
+            await handlers.onToken(chunk);
+          },
+        );
+        const text = finalText.trim();
         if (provider.isQuotaExhausted(text)) {
           throw new QuotaExhaustedError(providerId, activeEmail, text);
         }
@@ -265,6 +261,25 @@ export class FrontendGateway {
     const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
     const audio = await provider.captureReadAloud(page);
     return { provider: providerId, ...audio };
+  }
+
+  private async collectProviderStream(
+    stream: AsyncGenerator<string, string>,
+    onChunk?: (chunk: string) => Promise<void> | void,
+  ): Promise<{ streamedText: string; finalText: string }> {
+    const iterator = stream[Symbol.asyncIterator]();
+    let streamedText = "";
+
+    while (true) {
+      const { value, done } = await iterator.next();
+      if (done) {
+        const finalText = (value || streamedText).trim();
+        return { streamedText, finalText };
+      }
+
+      streamedText += value;
+      await onChunk?.(value);
+    }
   }
 }
 
