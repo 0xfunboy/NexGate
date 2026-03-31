@@ -83,6 +83,7 @@ async function executeCompareProvider(gateway: FrontendGateway, provider: Provid
       ok: true,
       latencyMs: Date.now() - startedAt,
       text: result.text,
+      images: result.images,
       audioSupported: provider === "grok",
     };
   } catch (error) {
@@ -308,8 +309,8 @@ export async function buildServer() {
           onToken: async (token) => {
             await writeSse(reply, { type: "token", delta: token });
           },
-          onComplete: async (text) => {
-            await writeSse(reply, { type: "done", text });
+          onComplete: async ({ text, images }) => {
+            await writeSse(reply, { type: "done", text, images });
             reply.raw.end();
           },
           onQuotaRotating: async ({ fromEmail, toEmail }) => {
@@ -435,6 +436,7 @@ export async function buildServer() {
         model: `${completionRequest.provider}:${completionRequest.model}`,
         created_at: new Date().toISOString(),
         response: result.text,
+        images: result.images,
         done: true,
       };
     }
@@ -450,7 +452,7 @@ export async function buildServer() {
           done: false,
         });
       },
-      onComplete: async (text) => {
+      onComplete: async ({ text }) => {
         await writeNdjson(reply, {
           model: `${completionRequest.provider}:${completionRequest.model}`,
           created_at: new Date().toISOString(),
@@ -479,6 +481,7 @@ export async function buildServer() {
         model: `${completionRequest.provider}:${completionRequest.model}`,
         created_at: new Date().toISOString(),
         message: { role: "assistant", content: result.text },
+        images: result.images,
         done: true,
       };
     }

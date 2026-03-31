@@ -1,6 +1,6 @@
 import type { Locator, Page, Response } from "playwright";
 
-import type { GatewayConfig, ProviderConfig, ProviderId } from "../types.js";
+import type { GatewayConfig, GeneratedImage, ProviderConfig, ProviderId } from "../types.js";
 import { sleep } from "../utils.js";
 
 /** Quota-exhaustion message patterns per provider. */
@@ -163,7 +163,7 @@ export class GenericFrontendProvider {
   async *streamResponse(
     page: Page,
     baseline: { count: number; lastText: string; mainText: string; prompt?: string },
-  ): AsyncGenerator<string, string> {
+  ): AsyncGenerator<string, { text: string; images: GeneratedImage[] }> {
     const startedAt = Date.now();
     let previous = "";
     let stableTicks = 0;
@@ -198,12 +198,14 @@ export class GenericFrontendProvider {
       await sleep(this.gatewayConfig.streamPollIntervalMs);
     }
 
-    if (!previous.trim()) {
+    previous = await this.finalizeStreamedMessage(page, baseline, previous, startedAt);
+    const images = await this.captureLastResponseImages(page);
+
+    if (!previous.trim() && images.length === 0) {
       throw new Error(`Provider ${this.config.id} non ha prodotto testo utile in risposta.`);
     }
 
-    previous = await this.finalizeStreamedMessage(page, baseline, previous, startedAt);
-    return previous;
+    return { text: previous, images };
   }
 
   async captureReadAloud(page: Page): Promise<{ data: Buffer; mimeType: string }> {
@@ -667,6 +669,260 @@ export class GenericFrontendProvider {
     }
 
     return "";
+  }
+
+  private async captureLastResponseImages(page: Page): Promise<GeneratedImage[]> {
+    if (this.config.id === "chatgpt") {
+      return this.readChatGptGeneratedImages(page);
+    }
+
+    if (this.config.id === "gemini") {
+      return this.readGeminiGeneratedImages(page);
+    }
+
+    if (this.config.id === "grok") {
+      return this.readGrokGeneratedImages(page);
+    }
+
+    if (this.config.id === "claude") {
+      return this.readClaudeGeneratedImages(page);
+    }
+
+    return [];
+  }
+
+  private async readChatGptGeneratedImages(page: Page): Promise<GeneratedImage[]> {
+    return page.evaluate(async (): Promise<GeneratedImage[]> => {
+      type DomLike = {
+        querySelectorAll: (selector: string) => unknown[];
+      };
+      type ImgLike = {
+        src?: string;
+        currentSrc?: string;
+        alt?: string;
+        naturalWidth?: number;
+        width?: number;
+        closest?: (selector: string) => unknown;
+      };
+      type NodeLike = {
+        querySelectorAll?: (selector: string) => ImgLike[];
+      };
+
+      const toDisplaySrc = async (src: string): Promise<string> => {
+        if (!src || src.startsWith("data:")) return src;
+        try {
+          const response = await fetch(src, { credentials: "include" });
+          if (!response.ok) return src;
+          const blob = await response.blob();
+          const buffer = await blob.arrayBuffer();
+          const bytes = Array.from(new Uint8Array(buffer));
+          const binary = bytes.map((value) => String.fromCharCode(value)).join("");
+          return `data:${blob.type || "image/png"};base64,${btoa(binary)}`;
+        } catch {
+          return src;
+        }
+      };
+
+      const doc = (globalThis as { document?: DomLike }).document;
+      if (!doc) return [];
+      const containers = Array.from(doc.querySelectorAll("[data-message-author-role='assistant']")) as NodeLike[];
+      const last = containers.at(-1);
+      if (!last?.querySelectorAll) return [];
+
+      const candidates = Array.from(last.querySelectorAll("img[src]"))
+        .map((img) => ({
+          src: img.currentSrc || img.src || "",
+          alt: img.alt || "",
+          score:
+            (/generated image/i.test(img.alt || "") ? 10 : 0) +
+            (img.closest?.(".group\\/imagegen-image, [id^='image-'], [data-testid='image-gen-overlay-actions']") ? 10 : 0) +
+            ((img.naturalWidth || img.width || 0) >= 256 ? 5 : 0),
+        }))
+        .filter((img) => img.src && img.score > 0);
+
+      const seen = new Set<string>();
+      const unique = candidates.filter((img) => {
+        if (seen.has(img.src)) return false;
+        seen.add(img.src);
+        return true;
+      }).slice(0, 4);
+
+      return Promise.all(unique.map(async (img) => ({ src: await toDisplaySrc(img.src), alt: img.alt })));
+    }).catch(() => []);
+  }
+
+  private async readGeminiGeneratedImages(page: Page): Promise<GeneratedImage[]> {
+    return page.evaluate(async (): Promise<GeneratedImage[]> => {
+      type DomLike = {
+        querySelectorAll: (selector: string) => unknown[];
+      };
+      type ImgLike = {
+        src?: string;
+        currentSrc?: string;
+        alt?: string;
+        naturalWidth?: number;
+        width?: number;
+        closest?: (selector: string) => unknown;
+      };
+      type NodeLike = {
+        parentElement?: {
+          closest?: (selector: string) => unknown;
+        } | null;
+        querySelectorAll?: (selector: string) => ImgLike[];
+      };
+
+      const toDisplaySrc = async (src: string): Promise<string> => {
+        if (!src || src.startsWith("data:")) return src;
+        try {
+          const response = await fetch(src, { credentials: "include" });
+          if (!response.ok) return src;
+          const blob = await response.blob();
+          const buffer = await blob.arrayBuffer();
+          const bytes = Array.from(new Uint8Array(buffer));
+          const binary = bytes.map((value) => String.fromCharCode(value)).join("");
+          return `data:${blob.type || "image/png"};base64,${btoa(binary)}`;
+        } catch {
+          return src;
+        }
+      };
+
+      const doc = (globalThis as { document?: DomLike }).document;
+      if (!doc) return [];
+      const all = Array.from(doc.querySelectorAll("message-content")) as NodeLike[];
+      const topLevel = all.filter((el) => el.parentElement?.closest?.("message-content") === null);
+      const last = topLevel.at(-1);
+      if (!last?.querySelectorAll) return [];
+
+      const candidates = Array.from(last.querySelectorAll("img[src]"))
+        .map((img) => ({
+          src: img.currentSrc || img.src || "",
+          alt: img.alt || "",
+          score:
+            (img.closest?.(".generated-images, generated-image, single-image, .attachment-container, .image-container") ? 10 : 0) +
+            ((img.naturalWidth || img.width || 0) >= 256 ? 5 : 0),
+        }))
+        .filter((img) => img.src && img.score > 0);
+
+      const seen = new Set<string>();
+      const unique = candidates.filter((img) => {
+        if (seen.has(img.src)) return false;
+        seen.add(img.src);
+        return true;
+      }).slice(0, 4);
+
+      return Promise.all(unique.map(async (img) => ({ src: await toDisplaySrc(img.src), alt: img.alt })));
+    }).catch(() => []);
+  }
+
+  private async readGrokGeneratedImages(page: Page): Promise<GeneratedImage[]> {
+    return page.evaluate(async (): Promise<GeneratedImage[]> => {
+      type DomLike = {
+        querySelectorAll: (selector: string) => unknown[];
+      };
+      type ImgLike = {
+        src?: string;
+        currentSrc?: string;
+        alt?: string;
+        naturalWidth?: number;
+        width?: number;
+      };
+      type NodeLike = {
+        querySelectorAll?: (selector: string) => ImgLike[];
+      };
+
+      const toDisplaySrc = async (src: string): Promise<string> => {
+        if (!src || src.startsWith("data:")) return src;
+        try {
+          const response = await fetch(src, { credentials: "include" });
+          if (!response.ok) return src;
+          const blob = await response.blob();
+          const buffer = await blob.arrayBuffer();
+          const bytes = Array.from(new Uint8Array(buffer));
+          const binary = bytes.map((value) => String.fromCharCode(value)).join("");
+          return `data:${blob.type || "image/png"};base64,${btoa(binary)}`;
+        } catch {
+          return src;
+        }
+      };
+
+      const doc = (globalThis as { document?: DomLike }).document;
+      if (!doc) return [];
+      const containers = Array.from(doc.querySelectorAll("[data-testid='message-assistant'], main article")) as NodeLike[];
+      const last = containers.at(-1);
+      if (!last?.querySelectorAll) return [];
+
+      const candidates = Array.from(last.querySelectorAll("img[src]"))
+        .map((img) => ({
+          src: img.currentSrc || img.src || "",
+          alt: img.alt || "",
+          score:
+            (/\/generated\//i.test(img.currentSrc || img.src || "") ? 10 : 0) +
+            ((img.naturalWidth || img.width || 0) >= 256 ? 5 : 0),
+        }))
+        .filter((img) => img.src && img.score > 0);
+
+      const seen = new Set<string>();
+      const unique = candidates.filter((img) => {
+        if (seen.has(img.src)) return false;
+        seen.add(img.src);
+        return true;
+      }).slice(0, 4);
+
+      return Promise.all(unique.map(async (img) => ({ src: await toDisplaySrc(img.src), alt: img.alt })));
+    }).catch(() => []);
+  }
+
+  private async readClaudeGeneratedImages(page: Page): Promise<GeneratedImage[]> {
+    return page.evaluate(async (): Promise<GeneratedImage[]> => {
+      type DomLike = {
+        querySelectorAll: (selector: string) => unknown[];
+      };
+      type ImgLike = {
+        src?: string;
+        currentSrc?: string;
+        alt?: string;
+        naturalWidth?: number;
+        width?: number;
+      };
+      const toDisplaySrc = async (src: string): Promise<string> => {
+        if (!src || src.startsWith("data:")) return src;
+        try {
+          const response = await fetch(src, { credentials: "include" });
+          if (!response.ok) return src;
+          const blob = await response.blob();
+          const buffer = await blob.arrayBuffer();
+          const bytes = Array.from(new Uint8Array(buffer));
+          const binary = bytes.map((value) => String.fromCharCode(value)).join("");
+          return `data:${blob.type || "image/png"};base64,${btoa(binary)}`;
+        } catch {
+          return src;
+        }
+      };
+
+      const doc = (globalThis as { document?: DomLike }).document;
+      if (!doc) return [];
+      const containers = Array.from(doc.querySelectorAll("[data-is-streaming], .font-claude-response"));
+      const last = containers.at(-1) as { querySelectorAll?: (selector: string) => ImgLike[] } | undefined;
+      if (!last?.querySelectorAll) return [];
+
+      const candidates = Array.from(last.querySelectorAll("img[src]"))
+        .map((img) => ({
+          src: img.currentSrc || img.src || "",
+          alt: img.alt || "",
+          score: (img.naturalWidth || img.width || 0) >= 256 ? 5 : 0,
+        }))
+        .filter((img) => img.src && img.score > 0)
+        .slice(0, 4);
+
+      const seen = new Set<string>();
+      const unique = candidates.filter((img) => {
+        if (seen.has(img.src)) return false;
+        seen.add(img.src);
+        return true;
+      });
+
+      return Promise.all(unique.map(async (img) => ({ src: await toDisplaySrc(img.src), alt: img.alt })));
+    }).catch(() => []);
   }
 
   private async finalizeStreamedMessage(

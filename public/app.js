@@ -572,7 +572,7 @@ async function runCompare() {
   showGlobalError(null);
 
   for (const pid of providers) {
-    state.results.set(pid, { text: "", ok: null, working: true, startTime: Date.now() });
+    state.results.set(pid, { text: "", images: [], ok: null, working: true, startTime: Date.now() });
   }
 
   renderResultCards();
@@ -637,6 +637,7 @@ async function streamProvider(providerId, prompt) {
         } else if (event.type === "done") {
           const latencyMs = Date.now() - startTime;
           entry.text = event.text ?? entry.text;
+          entry.images = Array.isArray(event.images) ? event.images : [];
           entry.ok = true;
           entry.working = false;
           entry.latencyMs = latencyMs;
@@ -646,6 +647,7 @@ async function streamProvider(providerId, prompt) {
           updateCompareMeta();
         } else if (event.type === "quota_rotating") {
           entry.text = "";
+          entry.images = [];
           entry.quotaRotating = true;
           entry.rotatingFrom = event.fromEmail;
           entry.rotatingTo = event.toEmail;
@@ -732,17 +734,11 @@ function buildCardElement(pid) {
         ${entry.code ? `<div class="result-error-code">${escHtml(entry.code)}</div>` : ""}
         ${entry.hint ? `<div class="result-error-hint">${escHtml(entry.hint)}</div>` : ""}
       </div>` : `
-      <div class="result-text" data-provider="${pid}"></div>`}
+      <div class="result-body" data-provider="${pid}"></div>`}
   `;
 
   if (entry.ok !== false) {
-    const textEl = card.querySelector(".result-text");
-    textEl.textContent = entry.text;
-    if (entry.working) {
-      const cursor = document.createElement("span");
-      cursor.className = "stream-cursor";
-      textEl.appendChild(cursor);
-    }
+    renderResultBody(card.querySelector(".result-body"), entry);
   }
 
   return card;
@@ -774,16 +770,15 @@ function updateResultCard(pid) {
         : t("badge_error");
   }
 
-  const textEl = existing.querySelector(".result-text");
-  if (textEl) {
-    const atBottom = textEl.scrollHeight - textEl.scrollTop <= textEl.clientHeight + 20;
-    textEl.textContent = entry.text;
-    if (entry.working) {
-      const cursor = document.createElement("span");
-      cursor.className = "stream-cursor";
-      textEl.appendChild(cursor);
-    }
-    if (atBottom) textEl.scrollTop = textEl.scrollHeight;
+  const bodyEl = existing.querySelector(".result-body");
+  if (bodyEl) {
+    const textEl = bodyEl.querySelector(".result-text");
+    const atBottom = textEl
+      ? textEl.scrollHeight - textEl.scrollTop <= textEl.clientHeight + 20
+      : true;
+    renderResultBody(bodyEl, entry);
+    const nextTextEl = bodyEl.querySelector(".result-text");
+    if (atBottom && nextTextEl) nextTextEl.scrollTop = nextTextEl.scrollHeight;
   }
 
   if (!entry.working && entry.ok !== null) {
@@ -797,6 +792,43 @@ function escHtml(str) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function renderResultBody(container, entry) {
+  if (!container) return;
+
+  const images = Array.isArray(entry.images) ? entry.images : [];
+  container.innerHTML = "";
+
+  if (images.length > 0) {
+    const gallery = document.createElement("div");
+    gallery.className = `result-images ${images.length === 1 ? "single" : "multi"}`;
+
+    for (const image of images) {
+      const frame = document.createElement("div");
+      frame.className = "result-image-frame";
+
+      const img = document.createElement("img");
+      img.className = "result-image";
+      img.src = image.src;
+      img.alt = image.alt || "Generated image";
+      img.loading = "lazy";
+      frame.appendChild(img);
+      gallery.appendChild(frame);
+    }
+
+    container.appendChild(gallery);
+  }
+
+  const textEl = document.createElement("div");
+  textEl.className = "result-text";
+  textEl.textContent = entry.text ?? "";
+  if (entry.working) {
+    const cursor = document.createElement("span");
+    cursor.className = "stream-cursor";
+    textEl.appendChild(cursor);
+  }
+  container.appendChild(textEl);
 }
 
 function setStatusKey(key, vars = {}, mode = "") {

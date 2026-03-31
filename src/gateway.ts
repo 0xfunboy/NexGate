@@ -4,7 +4,7 @@ import { AccountManager } from "./accounts.js";
 import { SessionManager } from "./browser/session-manager.js";
 import { QuotaExhaustedError } from "./errors.js";
 import { ProviderRegistry } from "./providers/registry.js";
-import type { CompletionRequest, GatewayConfig, ProviderId } from "./types.js";
+import type { CompletionRequest, CompletionResult, GatewayConfig, GeneratedImage, ProviderId } from "./types.js";
 import { randomId, toPrompt } from "./utils.js";
 
 export class FrontendGateway {
@@ -164,7 +164,7 @@ export class FrontendGateway {
     };
   }
 
-  async complete(request: CompletionRequest): Promise<{ id: string; text: string }> {
+  async complete(request: CompletionRequest): Promise<CompletionResult> {
     const providerId = request.provider;
     const provider = this.registry.get(providerId);
     const totalAccounts = this.accounts.getAll(providerId).length;
@@ -179,13 +179,13 @@ export class FrontendGateway {
       await provider.sendPrompt(page, prompt);
 
       try {
-        const { finalText } = await this.collectProviderStream(provider.streamResponse(page, { ...baseline, prompt }));
+        const { finalText, finalImages } = await this.collectProviderStream(provider.streamResponse(page, { ...baseline, prompt }));
         const text = finalText.trim();
         if (provider.isQuotaExhausted(text)) {
           throw new QuotaExhaustedError(providerId, activeEmail, text);
         }
 
-        return { id: randomId("cmpl"), text };
+        return { id: randomId("cmpl"), text, images: finalImages };
       } catch (err) {
         if (err instanceof QuotaExhaustedError) {
           const newEmail = this.accounts.rotate(providerId);
@@ -203,10 +203,10 @@ export class FrontendGateway {
     request: CompletionRequest,
     handlers: {
       onToken: (token: string) => Promise<void> | void;
-      onComplete: (fullText: string) => Promise<void> | void;
+      onComplete: (result: { text: string; images: GeneratedImage[] }) => Promise<void> | void;
       onQuotaRotating?: (info: { fromEmail: string; toEmail: string }) => Promise<void> | void;
     },
-  ): Promise<{ id: string; text: string }> {
+  ): Promise<CompletionResult> {
     const providerId = request.provider;
     const provider = this.registry.get(providerId);
     const totalAccounts = this.accounts.getAll(providerId).length;
@@ -221,7 +221,7 @@ export class FrontendGateway {
       await provider.sendPrompt(page, prompt);
 
       try {
-        const { finalText } = await this.collectProviderStream(
+        const { finalText, finalImages } = await this.collectProviderStream(
           provider.streamResponse(page, { ...baseline, prompt }),
           async (chunk) => {
             await handlers.onToken(chunk);
@@ -232,8 +232,8 @@ export class FrontendGateway {
           throw new QuotaExhaustedError(providerId, activeEmail, text);
         }
 
-        await handlers.onComplete(text);
-        return { id: randomId("cmpl"), text };
+        await handlers.onComplete({ text, images: finalImages });
+        return { id: randomId("cmpl"), text, images: finalImages };
       } catch (err) {
         if (err instanceof QuotaExhaustedError) {
           const newEmail = this.accounts.rotate(providerId);
@@ -264,17 +264,17 @@ export class FrontendGateway {
   }
 
   private async collectProviderStream(
-    stream: AsyncGenerator<string, string>,
+    stream: AsyncGenerator<string, { text: string; images: GeneratedImage[] }>,
     onChunk?: (chunk: string) => Promise<void> | void,
-  ): Promise<{ streamedText: string; finalText: string }> {
+  ): Promise<{ streamedText: string; finalText: string; finalImages: GeneratedImage[] }> {
     const iterator = stream[Symbol.asyncIterator]();
     let streamedText = "";
 
     while (true) {
       const { value, done } = await iterator.next();
       if (done) {
-        const finalText = (value || streamedText).trim();
-        return { streamedText, finalText };
+        const finalText = (value?.text || streamedText).trim();
+        return { streamedText, finalText, finalImages: value?.images ?? [] };
       }
 
       streamedText += value;

@@ -33,6 +33,17 @@ export interface GatewayConfig {
   streamMaxDurationMs: number;
 }
 
+export interface GeneratedImage {
+  src: string;
+  alt?: string;
+}
+
+export interface CompletionResult {
+  id: string;
+  text: string;
+  images: GeneratedImage[];
+}
+
 export interface CompletionRequest {
   provider: ProviderId;
   model: string;
