@@ -8,6 +8,8 @@ import type { CompletionRequest, CompletionResult, GatewayConfig, GeneratedImage
 import { randomId, toPrompt } from "./utils.js";
 
 export class FrontendGateway {
+  private readonly locks = new Map<ProviderId, Promise<void>>();
+
   constructor(
     private readonly registry: ProviderRegistry,
     private readonly sessions: SessionManager,
@@ -165,38 +167,40 @@ export class FrontendGateway {
   }
 
   async complete(request: CompletionRequest): Promise<CompletionResult> {
-    const providerId = request.provider;
-    const provider = this.registry.get(providerId);
-    const totalAccounts = this.accounts.getAll(providerId).length;
+    return this.withProviderLock(request.provider, async () => {
+      const providerId = request.provider;
+      const provider = this.registry.get(providerId);
+      const totalAccounts = this.accounts.getAll(providerId).length;
 
-    for (let attempt = 0; attempt < totalAccounts; attempt++) {
-      const activeEmail = this.accounts.getActiveEmail(providerId);
-      const profilePath = this.accounts.getActiveProfilePath(providerId);
-      const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
-      const prompt = toPrompt(request.messages);
-      await provider.ensureConversationNotFull(page);
-      const baseline = await provider.snapshotConversation(page);
-      await provider.sendPrompt(page, prompt);
+      for (let attempt = 0; attempt < totalAccounts; attempt++) {
+        const activeEmail = this.accounts.getActiveEmail(providerId);
+        const profilePath = this.accounts.getActiveProfilePath(providerId);
+        const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
+        const prompt = toPrompt(request.messages);
+        await provider.ensureConversationNotFull(page);
+        const baseline = await provider.snapshotConversation(page);
+        await provider.sendPrompt(page, prompt);
 
-      try {
-        const { finalText, finalImages } = await this.collectProviderStream(provider.streamResponse(page, { ...baseline, prompt }));
-        const text = finalText.trim();
-        if (provider.isQuotaExhausted(text)) {
-          throw new QuotaExhaustedError(providerId, activeEmail, text);
+        try {
+          const { finalText, finalImages } = await this.collectProviderStream(provider.streamResponse(page, { ...baseline, prompt }));
+          const text = finalText.trim();
+          if (provider.isQuotaExhausted(text)) {
+            throw new QuotaExhaustedError(providerId, activeEmail, text);
+          }
+
+          return { id: randomId("cmpl"), text, images: finalImages };
+        } catch (err) {
+          if (err instanceof QuotaExhaustedError) {
+            const newEmail = this.accounts.rotate(providerId);
+            await this.sessions.close(providerId);
+            if (newEmail !== null) continue;
+          }
+          throw err;
         }
-
-        return { id: randomId("cmpl"), text, images: finalImages };
-      } catch (err) {
-        if (err instanceof QuotaExhaustedError) {
-          const newEmail = this.accounts.rotate(providerId);
-          await this.sessions.close(providerId);
-          if (newEmail !== null) continue;
-        }
-        throw err;
       }
-    }
 
-    throw new Error(`Tutti gli account per ${request.provider} hanno la quota esaurita.`);
+      throw new Error(`Tutti gli account per ${request.provider} hanno la quota esaurita.`);
+    });
   }
 
   async stream(
@@ -207,48 +211,50 @@ export class FrontendGateway {
       onQuotaRotating?: (info: { fromEmail: string; toEmail: string }) => Promise<void> | void;
     },
   ): Promise<CompletionResult> {
-    const providerId = request.provider;
-    const provider = this.registry.get(providerId);
-    const totalAccounts = this.accounts.getAll(providerId).length;
+    return this.withProviderLock(request.provider, async () => {
+      const providerId = request.provider;
+      const provider = this.registry.get(providerId);
+      const totalAccounts = this.accounts.getAll(providerId).length;
 
-    for (let attempt = 0; attempt < totalAccounts; attempt++) {
-      const activeEmail = this.accounts.getActiveEmail(providerId);
-      const profilePath = this.accounts.getActiveProfilePath(providerId);
-      const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
-      const prompt = toPrompt(request.messages);
-      await provider.ensureConversationNotFull(page);
-      const baseline = await provider.snapshotConversation(page);
-      await provider.sendPrompt(page, prompt);
+      for (let attempt = 0; attempt < totalAccounts; attempt++) {
+        const activeEmail = this.accounts.getActiveEmail(providerId);
+        const profilePath = this.accounts.getActiveProfilePath(providerId);
+        const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
+        const prompt = toPrompt(request.messages);
+        await provider.ensureConversationNotFull(page);
+        const baseline = await provider.snapshotConversation(page);
+        await provider.sendPrompt(page, prompt);
 
-      try {
-        const { finalText, finalImages } = await this.collectProviderStream(
-          provider.streamResponse(page, { ...baseline, prompt }),
-          async (chunk) => {
-            await handlers.onToken(chunk);
-          },
-        );
-        const text = finalText.trim();
-        if (provider.isQuotaExhausted(text)) {
-          throw new QuotaExhaustedError(providerId, activeEmail, text);
-        }
-
-        await handlers.onComplete({ text, images: finalImages });
-        return { id: randomId("cmpl"), text, images: finalImages };
-      } catch (err) {
-        if (err instanceof QuotaExhaustedError) {
-          const newEmail = this.accounts.rotate(providerId);
-          await this.sessions.close(providerId);
-
-          if (newEmail !== null) {
-            await handlers.onQuotaRotating?.({ fromEmail: activeEmail, toEmail: newEmail });
-            continue;
+        try {
+          const { finalText, finalImages } = await this.collectProviderStream(
+            provider.streamResponse(page, { ...baseline, prompt }),
+            async (chunk) => {
+              await handlers.onToken(chunk);
+            },
+          );
+          const text = finalText.trim();
+          if (provider.isQuotaExhausted(text)) {
+            throw new QuotaExhaustedError(providerId, activeEmail, text);
           }
-        }
-        throw err;
-      }
-    }
 
-    throw new Error(`Tutti gli account per ${request.provider} hanno la quota esaurita.`);
+          await handlers.onComplete({ text, images: finalImages });
+          return { id: randomId("cmpl"), text, images: finalImages };
+        } catch (err) {
+          if (err instanceof QuotaExhaustedError) {
+            const newEmail = this.accounts.rotate(providerId);
+            await this.sessions.close(providerId);
+
+            if (newEmail !== null) {
+              await handlers.onQuotaRotating?.({ fromEmail: activeEmail, toEmail: newEmail });
+              continue;
+            }
+          }
+          throw err;
+        }
+      }
+
+      throw new Error(`Tutti gli account per ${request.provider} hanno la quota esaurita.`);
+    });
   }
 
   async close(): Promise<void> {
@@ -256,11 +262,32 @@ export class FrontendGateway {
   }
 
   async captureAudio(providerId: ProviderId): Promise<{ provider: ProviderId; data: Buffer; mimeType: string }> {
-    const provider = this.registry.get(providerId);
-    const profilePath = this.accounts.getActiveProfilePath(providerId);
-    const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
-    const audio = await provider.captureReadAloud(page);
-    return { provider: providerId, ...audio };
+    return this.withProviderLock(providerId, async () => {
+      const provider = this.registry.get(providerId);
+      const profilePath = this.accounts.getActiveProfilePath(providerId);
+      const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
+      const audio = await provider.captureReadAloud(page);
+      return { provider: providerId, ...audio };
+    });
+  }
+
+  private async withProviderLock<T>(providerId: ProviderId, fn: () => Promise<T>): Promise<T> {
+    const previous = this.locks.get(providerId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.locks.set(providerId, previous.then(() => current));
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.locks.get(providerId) === current) {
+        this.locks.delete(providerId);
+      }
+    }
   }
 
   private async collectProviderStream(
@@ -273,7 +300,7 @@ export class FrontendGateway {
     while (true) {
       const { value, done } = await iterator.next();
       if (done) {
-        const finalText = (value?.text || streamedText).trim();
+        const finalText = (value ? value.text : streamedText).trim();
         return { streamedText, finalText, finalImages: value?.images ?? [] };
       }
 

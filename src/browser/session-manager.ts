@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { chromium, type BrowserContext, type Page } from "playwright";
 
+import { ConversationStore } from "./conversation-store.js";
 import type { GatewayConfig, ProviderConfig, ProviderId } from "../types.js";
 
 interface ProviderSession {
@@ -33,8 +34,13 @@ export class SessionManager {
   private readonly pendingLaunches = new Map<string, Promise<BrowserContext>>();
   /** One active session per provider. */
   private readonly sessions = new Map<ProviderId, ProviderSession>();
+  private readonly store: ConversationStore;
 
-  constructor(private readonly gatewayConfig: GatewayConfig) {}
+  constructor(private readonly gatewayConfig: GatewayConfig) {
+    this.store = new ConversationStore(
+      path.join(this.gatewayConfig.baseProfileDir, this.gatewayConfig.browserProfileNamespace),
+    );
+  }
 
   // ── Profile path helpers ──────────────────────────────────
 
@@ -95,6 +101,9 @@ export class SessionManager {
     const context = await this.ensureContext(profilePath);
     const page = await context.newPage();
     const session: ProviderSession = { providerId: provider.id, profilePath, context, page };
+    const conversationKey = this.toConversationKey(provider.id, profilePath);
+
+    this.trackConversationUrl(page, conversationKey, provider);
 
     page.on("close", () => {
       const current = this.sessions.get(provider.id);
@@ -113,8 +122,22 @@ export class SessionManager {
     const profilePath = this.resolveProfilePath(relativeDir);
     const hadPersisted = await this.hasPersistedProfile(relativeDir);
     const session = await this.getOrCreate(provider, profilePath);
-    const targetUrl = hadPersisted ? provider.baseUrl : (provider.loginUrl ?? provider.baseUrl);
-    await session.page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    const stored = this.store.get(this.toConversationKey(provider.id, profilePath));
+    const targetUrl = stored?.url && hadPersisted
+      ? stored.url
+      : hadPersisted
+        ? provider.baseUrl
+        : (provider.loginUrl ?? provider.baseUrl);
+
+    try {
+      await session.page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    } catch (error) {
+      if (targetUrl !== provider.baseUrl) {
+        await session.page.goto(provider.baseUrl, { waitUntil: "domcontentloaded" });
+      } else {
+        throw error;
+      }
+    }
     await session.page.bringToFront();
     return session.page;
   }
@@ -182,6 +205,7 @@ export class SessionManager {
       viewport: { width: 1440, height: 960 },
       locale: "en-US",
       colorScheme: "dark",
+      acceptDownloads: true,
       args: [
         "--window-size=1440,960",
         "--disable-blink-features=AutomationControlled",
@@ -220,5 +244,48 @@ export class SessionManager {
     } catch {
       return false;
     }
+  }
+
+  private toConversationKey(providerId: ProviderId, profilePath: string): string {
+    const namespaceRoot = path.join(this.gatewayConfig.baseProfileDir, this.gatewayConfig.browserProfileNamespace);
+    const relativeProfile = path.relative(namespaceRoot, profilePath) || "_shared";
+    return `${providerId}:${relativeProfile}`;
+  }
+
+  private trackConversationUrl(page: Page, conversationKey: string, provider: ProviderConfig): void {
+    const baseOrigin = (() => {
+      try {
+        return new URL(provider.baseUrl).origin;
+      } catch {
+        return provider.baseUrl;
+      }
+    })();
+
+    const shouldStore = (url: string): boolean => {
+      if (!url || url === "about:blank") return false;
+      if (!url.startsWith(baseOrigin)) return false;
+      if (provider.loginUrl && url.startsWith(provider.loginUrl)) return false;
+      if (/\/auth\/login\b/i.test(url) || /accounts\.google\.com/i.test(url)) return false;
+      return true;
+    };
+
+    const persist = (url: string): void => {
+      if (!shouldStore(url)) return;
+      const existing = this.store.get(conversationKey);
+      if (existing?.url === url) return;
+      this.store.set(conversationKey, {
+        url,
+        updatedAt: new Date().toISOString(),
+      });
+    };
+
+    const handler = (frame: import("playwright").Frame): void => {
+      if (frame !== page.mainFrame()) return;
+      persist(frame.url());
+    };
+
+    page.on("framenavigated", handler);
+    page.on("close", () => page.off("framenavigated", handler));
+    persist(page.url());
   }
 }

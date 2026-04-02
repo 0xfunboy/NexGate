@@ -1,6 +1,6 @@
 import type { Locator, Page, Response } from "playwright";
 
-import type { GatewayConfig, GeneratedImage, ProviderConfig, ProviderId } from "../types.js";
+import type { ConversationSnapshot, GatewayConfig, GeneratedImage, ProviderConfig, ProviderId } from "../types.js";
 import { sleep } from "../utils.js";
 
 /** Quota-exhaustion message patterns per provider. */
@@ -88,8 +88,10 @@ export class GenericFrontendProvider {
     return 0;
   }
 
-  async snapshotConversation(page: Page): Promise<{ count: number; lastText: string; mainText: string }> {
+  async snapshotConversation(page: Page): Promise<ConversationSnapshot> {
     const mainText = await this.readMainText(page);
+    const imageKeys = await this.listVisibleImageKeys(page, this.getImageSelectors());
+    const imageNodeCount = await this.countRelevantImageNodes(page);
 
     const providerText = await this.readProviderAssistantText(page);
     if (providerText) {
@@ -97,6 +99,8 @@ export class GenericFrontendProvider {
         count: await this.countProviderAssistantNodes(page),
         lastText: providerText,
         mainText,
+        imageKeys,
+        imageNodeCount,
       };
     }
 
@@ -108,17 +112,19 @@ export class GenericFrontendProvider {
       }
 
       const lastText = this.sanitizeText(((await locator.last().innerText().catch(() => "")) || "").trim());
-      return { count, lastText, mainText };
+      return { count, lastText, mainText, imageKeys, imageNodeCount };
     }
 
-    return { count: 0, lastText: "", mainText };
+    return { count: 0, lastText: "", mainText, imageKeys, imageNodeCount };
   }
 
   async sendPrompt(page: Page, prompt: string): Promise<void> {
     await this.ensureReady(page);
     await this.waitUntilIdle(page, 20_000);
 
-    const input = await this.firstVisibleLocator(page, [this.config.inputSelector, ...this.config.readySelectors], 10_000);
+    const input = this.config.id === "gemini"
+      ? await this.waitForStableInput(page, 15_000)
+      : await this.firstVisibleLocator(page, [this.config.inputSelector, ...this.config.readySelectors], 10_000);
     if (!input) {
       throw new Error(`Input non trovato per ${this.config.id}.`);
     }
@@ -133,7 +139,27 @@ export class GenericFrontendProvider {
         (element as { focus?: () => void; textContent: string | null }).focus?.();
         element.textContent = "";
       });
-      await page.keyboard.type(prompt);
+      if (this.config.id === "gemini") {
+        const lines = prompt.split("\n");
+        for (let index = 0; index < lines.length; index += 1) {
+          if (index > 0) {
+            await input.press("Shift+Enter").catch(() => undefined);
+          }
+          if (lines[index]) {
+            await input.pressSequentially(lines[index], { delay: 0 });
+          }
+        }
+      } else {
+        await page.keyboard.type(prompt);
+      }
+    }
+
+    if (this.config.id === "gemini") {
+      await input.click().catch(() => undefined);
+      await sleep(80);
+      await this.submitGeminiPrompt(page);
+      await this.ensurePromptSubmitted(page, input, prompt);
+      return;
     }
 
     let attemptedSubmit = false;
@@ -168,7 +194,7 @@ export class GenericFrontendProvider {
 
   async *streamResponse(
     page: Page,
-    baseline: { count: number; lastText: string; mainText: string; prompt?: string },
+    baseline: ConversationSnapshot,
   ): AsyncGenerator<string, { text: string; images: GeneratedImage[] }> {
     const startedAt = Date.now();
     let previous = "";
@@ -181,7 +207,7 @@ export class GenericFrontendProvider {
       }
 
       const current = await this.readLastMessage(page, baseline);
-      const hasImageSignal = await this.hasLastResponseImages(page);
+      const hasImageSignal = await this.hasLastResponseImages(page, baseline);
       if (current && current !== previous) {
         const delta = current.startsWith(previous) ? current.slice(previous.length) : "";
         previous = current;
@@ -209,8 +235,11 @@ export class GenericFrontendProvider {
       await sleep(this.gatewayConfig.streamPollIntervalMs);
     }
 
-    previous = await this.finalizeStreamedMessage(page, baseline, previous, startedAt);
-    const images = await this.captureLastResponseImages(page);
+    previous = this.extractNewTextSinceBaseline(
+      baseline,
+      await this.finalizeStreamedMessage(page, baseline, previous, startedAt),
+    );
+    const images = await this.captureLastResponseImages(page, baseline);
 
     if (!previous.trim() && images.length === 0) {
       throw new Error(`Provider ${this.config.id} non ha prodotto testo utile in risposta.`);
@@ -255,7 +284,12 @@ export class GenericFrontendProvider {
     throw new Error("Grok non ha esposto un audio leggibile dopo il click su read aloud.");
   }
 
-  private async readLastMessage(page: Page, baseline: { count: number; lastText: string; mainText: string; prompt?: string }): Promise<string> {
+  private async readLastMessage(page: Page, baseline: ConversationSnapshot): Promise<string> {
+    const currentCount = await this.countProviderAssistantNodes(page);
+    if (currentCount <= baseline.count) {
+      return "";
+    }
+
     const providerText = this.sanitizeText(await this.readProviderAssistantText(page), baseline.prompt);
     if (providerText && providerText !== baseline.lastText) {
       // Handle in-place updates (e.g. Gemini appending new response after old in same container).
@@ -368,6 +402,103 @@ export class GenericFrontendProvider {
     return selector ? page.locator(selector).first() : null;
   }
 
+  private async waitForStableInput(page: Page, timeoutMs: number): Promise<Locator | null> {
+    const selectors = [this.config.inputSelector, ...this.config.readySelectors];
+    const deadline = Date.now() + timeoutMs;
+    let previousHandle: unknown = null;
+
+    while (Date.now() < deadline) {
+      const selector = await this.findFirstVisible(page, selectors, 5_000);
+      if (!selector) {
+        await sleep(300);
+        continue;
+      }
+
+      const locator = page.locator(selector).first();
+      const handle = await locator.evaluateHandle((element) => element).catch(() => null);
+      if (!handle) {
+        await sleep(300);
+        continue;
+      }
+
+      if (previousHandle !== null) {
+        const isSame = await page
+          .evaluate(([left, right]) => left === right, [previousHandle, handle] as [unknown, unknown])
+          .catch(() => false);
+
+        await handle.dispose?.().catch(() => undefined);
+        if (isSame) {
+          return locator;
+        }
+
+        previousHandle = null;
+        await sleep(400);
+        continue;
+      }
+
+      previousHandle = handle;
+      await sleep(400);
+    }
+
+    return null;
+  }
+
+  private async submitGeminiPrompt(page: Page): Promise<void> {
+    if (this.config.submitSelector) {
+      const submit = page.locator(this.config.submitSelector).first();
+      if (await submit.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        try {
+          await submit.click({ force: true, timeout: 5_000 });
+          return;
+        } catch {
+          // Fall through to keyboard submission.
+        }
+      }
+    }
+
+    const contentEditable = page.locator("rich-textarea div[contenteditable='true']").first();
+    if (await contentEditable.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      try {
+        await contentEditable.press("Enter", { timeout: 5_000 });
+        return;
+      } catch {
+        // Fall through to JS event dispatch.
+      }
+    }
+
+    await page.evaluate(() => {
+      type DispatchTarget = {
+        dispatchEvent: (event: unknown) => boolean;
+      };
+      type DocLike = {
+        activeElement?: DispatchTarget | null;
+        querySelector: (selector: string) => DispatchTarget | null;
+      };
+      type KeyboardEventCtor = new (type: string, init: Record<string, unknown>) => unknown;
+
+      const root = globalThis as {
+        document?: DocLike;
+        KeyboardEvent?: KeyboardEventCtor;
+      };
+
+      const element = root.document?.activeElement ?? root.document?.querySelector("[contenteditable='true']");
+      if (!element) return;
+      const EventCtor = root.KeyboardEvent;
+      if (!EventCtor) return;
+
+      for (const type of ["keydown", "keypress", "keyup"] as const) {
+        element.dispatchEvent(new EventCtor(type, {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        }));
+      }
+    }).catch(() => undefined);
+  }
+
   private async ensurePromptSubmitted(page: Page, input: Locator, prompt: string): Promise<void> {
     if (this.config.id !== "gemini") {
       return;
@@ -375,7 +506,16 @@ export class GenericFrontendProvider {
 
     const normalizedPrompt = prompt.trim();
     const looksUnsent = async (): Promise<boolean> => {
-      const current = await input
+      const freshInput = await this.firstVisibleLocator(
+        page,
+        [this.config.inputSelector, "rich-textarea div[contenteditable='true']"],
+        1_500,
+      );
+      if (!freshInput) {
+        return false;
+      }
+
+      const current = await freshInput
         .evaluate((element) => {
           const field = element as {
             value?: string;
@@ -401,6 +541,9 @@ export class GenericFrontendProvider {
         return;
       }
     }
+
+    await this.submitGeminiPrompt(page);
+    await sleep(500);
   }
 
   async isReady(page: Page): Promise<boolean> {
@@ -717,12 +860,20 @@ export class GenericFrontendProvider {
     return "";
   }
 
-  private async captureLastResponseImages(page: Page): Promise<GeneratedImage[]> {
-    return this.captureImagesFromSelectors(page, this.getImageSelectors());
+  private async captureLastResponseImages(page: Page, baseline: ConversationSnapshot): Promise<GeneratedImage[]> {
+    if (this.config.id === "gemini") {
+      return this.captureGeminiImages(page, baseline);
+    }
+
+    return this.captureImagesFromSelectors(page, this.getImageSelectors(), new Set(baseline.imageKeys));
   }
 
-  private async hasLastResponseImages(page: Page): Promise<boolean> {
-    return (await this.countImageCandidates(page, this.getImageSelectors())) > 0;
+  private async hasLastResponseImages(page: Page, baseline: ConversationSnapshot): Promise<boolean> {
+    if (this.config.id === "gemini") {
+      return this.hasNewGeminiImages(page, baseline);
+    }
+
+    return (await this.countImageCandidates(page, this.getImageSelectors(), new Set(baseline.imageKeys))) > 0;
   }
 
   private getImageSelectors(): string[] {
@@ -735,7 +886,13 @@ export class GenericFrontendProvider {
     }
 
     if (this.config.id === "grok") {
-      return ["main article img[src]", "[data-testid='message-assistant'] img[src]"];
+      return [
+        "#last-reply-container .group\\/grok-image",
+        "#last-reply-container img[src*='/generated/']",
+        "[id^='response-'] .group\\/grok-image",
+        "[id^='response-'] img[src*='/generated/']",
+        "main img[src*='/generated/']",
+      ];
     }
 
     if (this.config.id === "claude") {
@@ -745,7 +902,7 @@ export class GenericFrontendProvider {
     return [];
   }
 
-  private async countImageCandidates(page: Page, selectors: string[]): Promise<number> {
+  private async countImageCandidates(page: Page, selectors: string[], seen = new Set<string>()): Promise<number> {
     let total = 0;
 
     for (const selector of selectors) {
@@ -760,6 +917,9 @@ export class GenericFrontendProvider {
 
         const box = await node.boundingBox().catch(() => null);
         if (!box || box.width < 120 || box.height < 120) continue;
+        const meta = await this.readImageMeta(node);
+        const dedupeKey = meta.src || `${selector}:${index}:${Math.round(box.width)}x${Math.round(box.height)}`;
+        if (seen.has(dedupeKey)) continue;
         total += 1;
       }
     }
@@ -767,9 +927,205 @@ export class GenericFrontendProvider {
     return total;
   }
 
-  private async captureImagesFromSelectors(page: Page, selectors: string[]): Promise<GeneratedImage[]> {
+  private async countRelevantImageNodes(page: Page): Promise<number> {
+    if (this.config.id === "gemini") {
+      let total = 0;
+      for (const selector of ["generated-image", "single-image", ".generated-images"]) {
+        total += await page.locator(selector).count().catch(() => 0);
+      }
+      return total;
+    }
+
+    return this.countImageCandidates(page, this.getImageSelectors());
+  }
+
+  private async hasNewGeminiImages(page: Page, baseline: ConversationSnapshot): Promise<boolean> {
+    const current = await this.countRelevantImageNodes(page);
+    if (current <= baseline.imageNodeCount) {
+      return false;
+    }
+
+    for (const selector of ["generated-image", "single-image", ".generated-images"]) {
+      const node = page.locator(selector).last();
+      if (!(await node.isVisible().catch(() => false))) continue;
+
+      const box = await node.boundingBox().catch(() => null);
+      if (box && box.width >= 100 && box.height >= 100) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async isGeminiImageLoaded(page: Page): Promise<boolean> {
+    return page.evaluate((): boolean => {
+      type ImageLike = {
+        complete?: boolean;
+        naturalWidth?: number;
+      };
+      type ShadowRootLike = {
+        querySelector: (selector: string) => ImageLike | null;
+      };
+      type ContainerLike = {
+        querySelector: (selector: string) => ImageLike | null;
+        shadowRoot?: ShadowRootLike;
+      };
+      type DocLike = {
+        querySelectorAll: (selector: string) => unknown[];
+      };
+
+      const doc = (globalThis as { document?: DocLike }).document;
+      if (!doc) return false;
+
+      const containers = [
+        ...Array.from(doc.querySelectorAll("generated-image")),
+        ...Array.from(doc.querySelectorAll("single-image")),
+        ...Array.from(doc.querySelectorAll(".generated-images")),
+      ];
+
+      for (const container of containers) {
+        const node = container as ContainerLike;
+        const lightDomImage = node.querySelector("img");
+        if (lightDomImage && lightDomImage.complete && (lightDomImage.naturalWidth ?? 0) > 0) {
+          return true;
+        }
+
+        const shadowRoot = node.shadowRoot;
+        if (shadowRoot) {
+          const shadowImage = shadowRoot.querySelector("img");
+          if (shadowImage && shadowImage.complete && (shadowImage.naturalWidth ?? 0) > 0) {
+            return true;
+          }
+        }
+      }
+
+      const nestedImages = Array.from(doc.querySelectorAll("generated-image img, single-image img")) as ImageLike[];
+      return nestedImages.some((image) => image.complete && (image.naturalWidth ?? 0) > 0);
+    }).catch(() => false);
+  }
+
+  private async waitForGeminiImageReady(page: Page, timeoutMs = 45_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await this.isGeminiImageLoaded(page)) {
+        return true;
+      }
+      await sleep(500);
+    }
+    return false;
+  }
+
+  private async captureGeminiImages(page: Page, baseline: ConversationSnapshot): Promise<GeneratedImage[]> {
+    const hasImage = await this.hasNewGeminiImages(page, baseline);
+    if (!hasImage) {
+      return [];
+    }
+
+    await this.waitForGeminiImageReady(page, 45_000);
+    const downloaded = await this.downloadGeminiLastImage(page);
+    if (downloaded) {
+      return [{
+        src: `data:image/jpeg;base64,${downloaded.toString("base64")}`,
+      }];
+    }
+
+    const images = await this.readGeminiGeneratedImages(page);
+    const fresh = images.filter((image) => !baseline.imageKeys.includes(image.src));
+    return fresh.slice(0, 4);
+  }
+
+  private async downloadGeminiLastImage(page: Page): Promise<Buffer | null> {
+    await this.waitForGeminiImageReady(page, 45_000);
+
+    for (const containerSelector of ["generated-image", "single-image", ".generated-images"]) {
+      const container = page.locator(containerSelector).last();
+      if (!(await container.isVisible().catch(() => false))) {
+        continue;
+      }
+
+      await container.hover({ force: true }).catch(() => undefined);
+      await sleep(700);
+
+      const directButton = page
+        .locator(".button-icon-wrapper")
+        .filter({ has: page.locator('mat-icon[fonticon="download"]') })
+        .last();
+
+      if (await directButton.isVisible().catch(() => false)) {
+        const file = await this.triggerDownload(page, directButton);
+        if (file) {
+          return file;
+        }
+      }
+
+      const moreButton = page
+        .locator('button[aria-label*="More"], button[aria-label*="options"], mat-icon[fonticon="more_vert"]')
+        .last();
+
+      if (!(await moreButton.isVisible().catch(() => false))) {
+        continue;
+      }
+
+      await moreButton.click({ force: true }).catch(() => undefined);
+      await sleep(400);
+
+      const menuItem = page.locator('[data-test-id="image-download-button"]').first();
+      if (await menuItem.isVisible().catch(() => false)) {
+        const file = await this.triggerDownload(page, menuItem);
+        if (file) {
+          return file;
+        }
+      }
+
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await sleep(200);
+    }
+
+    return null;
+  }
+
+  private async triggerDownload(page: Page, locator: Locator): Promise<Buffer | null> {
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: 20_000 }),
+        locator.click({ force: true }),
+      ]);
+      const filePath = await download.path();
+      if (!filePath) {
+        return null;
+      }
+      const { readFile } = await import("node:fs/promises");
+      return readFile(filePath);
+    } catch {
+      return null;
+    }
+  }
+
+  private async readImageMeta(node: Locator): Promise<{ src: string; alt: string }> {
+    return node
+      .evaluate((element) => {
+        type MaybeImage = {
+          currentSrc?: string;
+          src?: string;
+          alt?: string;
+          querySelector?: (selector: string) => MaybeImage | null;
+        };
+
+        const direct = element as MaybeImage;
+        const nested = element.querySelector?.("img[src]") as MaybeImage | null;
+        const image = (direct.currentSrc || direct.src ? direct : nested) ?? nested;
+
+        return {
+          src: image?.currentSrc || image?.src || "",
+          alt: image?.alt || "",
+        };
+      })
+      .catch(() => ({ src: "", alt: "" }));
+  }
+
+  private async captureImagesFromSelectors(page: Page, selectors: string[], seen = new Set<string>()): Promise<GeneratedImage[]> {
     const results: GeneratedImage[] = [];
-    const seen = new Set<string>();
 
     for (const selector of selectors) {
       const locator = page.locator(selector);
@@ -788,20 +1144,7 @@ export class GenericFrontendProvider {
         const box = await node.boundingBox().catch(() => null);
         if (!box || box.width < 120 || box.height < 120) continue;
 
-        const meta = await node
-          .evaluate((element) => {
-            const image = element as {
-              currentSrc?: string;
-              src?: string;
-              alt?: string;
-            };
-
-            return {
-              src: image.currentSrc || image.src || "",
-              alt: image.alt || "",
-            };
-          })
-          .catch(() => ({ src: "", alt: "" }));
+        const meta = await this.readImageMeta(node);
 
         const dedupeKey = meta.src || `${selector}:${index}:${Math.round(box.width)}x${Math.round(box.height)}`;
         if (seen.has(dedupeKey)) continue;
@@ -945,7 +1288,7 @@ export class GenericFrontendProvider {
 
   private async readGrokGeneratedImages(page: Page): Promise<GeneratedImage[]> {
     return page.evaluate(async (): Promise<GeneratedImage[]> => {
-      type DomLike = {
+      type QueryRootLike = {
         querySelectorAll: (selector: string) => unknown[];
       };
       type ImgLike = {
@@ -954,9 +1297,7 @@ export class GenericFrontendProvider {
         alt?: string;
         naturalWidth?: number;
         width?: number;
-      };
-      type NodeLike = {
-        querySelectorAll?: (selector: string) => ImgLike[];
+        closest?: (selector: string) => unknown;
       };
 
       const toDisplaySrc = async (src: string): Promise<string> => {
@@ -974,24 +1315,40 @@ export class GenericFrontendProvider {
         }
       };
 
-      const doc = (globalThis as { document?: DomLike }).document;
+      const doc = (globalThis as { document?: QueryRootLike }).document;
       if (!doc) return [];
-      const containers = Array.from(doc.querySelectorAll("[data-testid='message-assistant'], main article")) as NodeLike[];
-      const last = containers.at(-1);
-      if (!last?.querySelectorAll) return [];
 
-      const candidates = Array.from(last.querySelectorAll("img[src]"))
+      const containerSelectors = [
+        "#last-reply-container [id^='response-']",
+        "#last-reply-container",
+        "[id^='response-']",
+        "[data-testid='message-assistant']",
+        "main",
+      ];
+
+      let scope: QueryRootLike = doc;
+      for (const selector of containerSelectors) {
+        const matches = Array.from(doc.querySelectorAll(selector)) as QueryRootLike[];
+        if (matches.length > 0) {
+          scope = matches.at(-1) ?? doc;
+          break;
+        }
+      }
+
+      const candidates = Array.from(scope.querySelectorAll(".group\\/grok-image img[src], img[src*='/generated/']")) as ImgLike[];
+      const scored = candidates
         .map((img) => ({
           src: img.currentSrc || img.src || "",
           alt: img.alt || "",
           score:
+            (img.closest?.(".group\\/grok-image") ? 10 : 0) +
             (/\/generated\//i.test(img.currentSrc || img.src || "") ? 10 : 0) +
             ((img.naturalWidth || img.width || 0) >= 256 ? 5 : 0),
         }))
         .filter((img) => img.src && img.score > 0);
 
       const seen = new Set<string>();
-      const unique = candidates.filter((img) => {
+      const unique = scored.filter((img) => {
         if (seen.has(img.src)) return false;
         seen.add(img.src);
         return true;
@@ -1056,7 +1413,7 @@ export class GenericFrontendProvider {
 
   private async finalizeStreamedMessage(
     page: Page,
-    baseline: { count: number; lastText: string; mainText: string; prompt?: string },
+    baseline: ConversationSnapshot,
     current: string,
     startedAt: number,
   ): Promise<string> {
@@ -1089,6 +1446,53 @@ export class GenericFrontendProvider {
 
   private shouldUseSelectorFallback(): boolean {
     return this.config.id === "grok";
+  }
+
+  private extractNewTextSinceBaseline(baseline: ConversationSnapshot, text: string): string {
+    const current = this.sanitizeText(text, baseline.prompt);
+    if (!current) {
+      return "";
+    }
+
+    if (!baseline.lastText) {
+      return current;
+    }
+
+    if (current === baseline.lastText) {
+      return "";
+    }
+
+    if (current.startsWith(baseline.lastText)) {
+      const suffix = current.slice(baseline.lastText.length).trim();
+      return suffix.length > 0 ? suffix : "";
+    }
+
+    return current;
+  }
+
+  private async listVisibleImageKeys(page: Page, selectors: string[]): Promise<string[]> {
+    const keys = new Set<string>();
+
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      if (count === 0) continue;
+
+      for (let index = 0; index < count; index += 1) {
+        const node = locator.nth(index);
+        const visible = await node.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        const box = await node.boundingBox().catch(() => null);
+        if (!box || box.width < 120 || box.height < 120) continue;
+
+        const meta = await this.readImageMeta(node);
+        if (!meta.src) continue;
+        keys.add(meta.src);
+      }
+    }
+
+    return Array.from(keys);
   }
 
   private extractTextDelta(before: string, after: string): string {

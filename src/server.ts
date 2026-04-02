@@ -11,7 +11,7 @@ import { loadGatewayConfig, loadProviderConfigs } from "./config.js";
 import { toUiError } from "./errors.js";
 import { FrontendGateway, setupNdjsonHeaders, setupSseHeaders, writeNdjson, writeOpenAiDone, writeSse } from "./gateway.js";
 import { ProviderRegistry } from "./providers/registry.js";
-import type { AccountConfig, ChatMessage, CompletionRequest, ProviderId } from "./types.js";
+import type { AccountConfig, ChatMessage, ChatRole, CompletionRequest, ProviderId } from "./types.js";
 import { nowUnix, parseModelProvider } from "./utils.js";
 
 const providerSchema = z.enum(["chatgpt", "claude", "gemini", "grok"]);
@@ -20,12 +20,39 @@ const messageSchema = z.object({
   content: z.string(),
 });
 
+const textPartSchema = z.object({
+  type: z.string().optional(),
+  text: z.string().optional(),
+  input_text: z.string().optional(),
+}).passthrough();
+
+const openAiMessageSchema = z.object({
+  role: z.enum(["system", "developer", "user", "assistant", "tool"]),
+  content: z.union([z.string(), z.array(textPartSchema), z.null()]).optional().default(""),
+}).passthrough();
+
 const openAiRequestSchema = z.object({
   provider: providerSchema.optional(),
   model: z.string().default("chatgpt:frontend-default"),
-  messages: z.array(messageSchema).min(1),
+  messages: z.array(openAiMessageSchema).min(1),
   stream: z.boolean().optional().default(false),
-});
+}).passthrough();
+
+const responseInputMessageSchema = z.object({
+  role: z.enum(["system", "developer", "user", "assistant", "tool"]).optional().default("user"),
+  content: z.union([
+    z.string(),
+    z.array(textPartSchema),
+  ]),
+}).passthrough();
+
+const responsesRequestSchema = z.object({
+  provider: providerSchema.optional(),
+  model: z.string().default("chatgpt:frontend-default"),
+  input: z.union([z.string().min(1), z.array(responseInputMessageSchema).min(1)]),
+  instructions: z.string().optional(),
+  stream: z.boolean().optional().default(false),
+}).passthrough();
 
 const ollamaGenerateSchema = z.object({
   provider: providerSchema.optional(),
@@ -65,6 +92,112 @@ function toCompletionRequest(input: {
     model: resolved.model,
     messages: input.messages,
     stream: input.stream,
+  };
+}
+
+function normalizeRole(role?: string): ChatRole {
+  if (role === "developer") {
+    return "system";
+  }
+
+  if (role === "system" || role === "user" || role === "assistant" || role === "tool") {
+    return role;
+  }
+
+  return "user";
+}
+
+function extractTextContent(content: string | Array<{ text?: string; input_text?: string }> | null | undefined): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!content) {
+    return "";
+  }
+
+  return content
+    .map((part) => part.text ?? part.input_text ?? "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+function toChatMessages(input: Array<{ role?: string; content?: string | Array<{ text?: string; input_text?: string }> | null }>): ChatMessage[] {
+  return input
+    .map((message) => ({
+      role: normalizeRole(message.role),
+      content: extractTextContent(message.content).trim(),
+    }))
+    .filter((message) => message.content.length > 0);
+}
+
+function toResponseMessages(
+  input: string | Array<{ role?: string; content: string | Array<{ text?: string; input_text?: string }> }>,
+  instructions?: string,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+
+  if (instructions?.trim()) {
+    messages.push({ role: "system", content: instructions.trim() });
+  }
+
+  if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+    return messages;
+  }
+
+  messages.push(...toChatMessages(input));
+  return messages;
+}
+
+function estimateTokens(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  return Math.max(1, Math.ceil(trimmed.length / 4));
+}
+
+function buildUsage(inputMessages: ChatMessage[], outputText: string) {
+  const promptText = inputMessages.map((message) => message.content).join("\n");
+  const promptTokens = estimateTokens(promptText);
+  const completionTokens = estimateTokens(outputText);
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  };
+}
+
+function toOpenAiResponseObject(args: {
+  id: string;
+  model: string;
+  text: string;
+  images?: { src: string; alt?: string }[];
+  inputMessages?: ChatMessage[];
+}) {
+  const messageId = `msg_${args.id}`;
+  return {
+    id: args.id,
+    object: "response",
+    created_at: nowUnix(),
+    status: "completed",
+    model: args.model,
+    output: [
+      {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: args.text,
+            annotations: [],
+          },
+        ],
+      },
+    ],
+    output_text: args.text,
+    images: args.images ?? [],
+    usage: buildUsage(args.inputMessages ?? [], args.text),
   };
 }
 
@@ -132,6 +265,7 @@ export async function buildServer() {
   }
 
   app.get("/", async (_request, reply) => serveStatic(reply, "index.html", "text/html; charset=utf-8"));
+  app.get("/docs", async (_request, reply) => serveStatic(reply, "docs.html", "text/html; charset=utf-8"));
   app.get("/app.js", async (_request, reply) => serveStatic(reply, "app.js", "application/javascript; charset=utf-8"));
   app.get("/styles.css", async (_request, reply) => serveStatic(reply, "styles.css", "text/css; charset=utf-8"));
 
@@ -366,12 +500,18 @@ export async function buildServer() {
 
   app.post("/v1/chat/completions", async (request, reply) => {
     const body = openAiRequestSchema.parse(request.body);
-    const completionRequest = toCompletionRequest(body);
+    const messages = toChatMessages(body.messages);
+    const completionRequest = toCompletionRequest({
+      provider: body.provider,
+      model: body.model,
+      messages,
+      stream: body.stream,
+    });
 
     if (!body.stream) {
       const result = await gateway.complete(completionRequest);
       return {
-        id: result.id,
+        id: `chatcmpl_${result.id}`,
         object: "chat.completion",
         created: nowUnix(),
         model: `${completionRequest.provider}:${completionRequest.model}`,
@@ -382,14 +522,27 @@ export async function buildServer() {
             finish_reason: "stop",
           },
         ],
+        images: result.images,
+        usage: buildUsage(messages, result.text),
       };
     }
 
     setupSseHeaders(reply);
     const completionId = `chatcmpl_${Date.now()}`;
+    let sentRoleChunk = false;
 
     await gateway.stream(completionRequest, {
       onToken: async (token) => {
+        if (!sentRoleChunk) {
+          sentRoleChunk = true;
+          await writeSse(reply, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: nowUnix(),
+            model: `${completionRequest.provider}:${completionRequest.model}`,
+            choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+          });
+        }
         await writeSse(reply, {
           id: completionId,
           object: "chat.completion.chunk",
@@ -407,6 +560,119 @@ export async function buildServer() {
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
         });
         await writeOpenAiDone(reply);
+        reply.raw.end();
+      },
+    });
+
+    return reply;
+  });
+
+  app.get("/v1/models", async () => {
+    const models = registry.list().map((provider) => ({
+      id: `${provider.config.id}:frontend-default`,
+      object: "model",
+      created: 0,
+      owned_by: "frontend-llm-gateway",
+    }));
+
+    return {
+      object: "list",
+      data: models,
+    };
+  });
+
+  app.get("/v1/models/:model", async (request, reply) => {
+    const params = z.object({ model: z.string().min(1) }).parse(request.params);
+    const model = registry.list().find((provider) => `${provider.config.id}:frontend-default` === params.model);
+    if (!model) {
+      reply.status(404);
+      return {
+        error: {
+          message: `Model ${params.model} not found`,
+          type: "invalid_request_error",
+          param: "model",
+          code: "model_not_found",
+        },
+      };
+    }
+
+    return {
+      id: `${model.config.id}:frontend-default`,
+      object: "model",
+      created: 0,
+      owned_by: "frontend-llm-gateway",
+    };
+  });
+
+  app.post("/v1/responses", async (request, reply) => {
+    const body = responsesRequestSchema.parse(request.body);
+    const messages = toResponseMessages(body.input, body.instructions);
+    const completionRequest = toCompletionRequest({
+      provider: body.provider,
+      model: body.model,
+      messages,
+      stream: body.stream,
+    });
+
+    if (!body.stream) {
+      const result = await gateway.complete(completionRequest);
+      return toOpenAiResponseObject({
+        id: result.id,
+        model: `${completionRequest.provider}:${completionRequest.model}`,
+        text: result.text,
+        images: result.images,
+        inputMessages: messages,
+      });
+    }
+
+    setupSseHeaders(reply);
+    const responseId = `resp_${Date.now()}`;
+    const model = `${completionRequest.provider}:${completionRequest.model}`;
+    const messageId = `msg_${responseId}`;
+    let streamedText = "";
+
+    await writeSse(reply, {
+      type: "response.created",
+      response: {
+        id: responseId,
+        object: "response",
+        created_at: nowUnix(),
+        status: "in_progress",
+        model,
+      },
+    });
+
+    await gateway.stream(completionRequest, {
+      onToken: async (token) => {
+        streamedText += token;
+        await writeSse(reply, {
+          type: "response.output_text.delta",
+          response_id: responseId,
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          delta: token,
+        });
+      },
+      onComplete: async ({ text, images }) => {
+        await writeSse(reply, {
+          type: "response.output_text.done",
+          response_id: responseId,
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          text,
+        });
+        await writeSse(reply, {
+          type: "response.completed",
+          response: toOpenAiResponseObject({
+            id: responseId,
+            model,
+            text: text || streamedText,
+            images,
+            inputMessages: messages,
+          }),
+        });
         reply.raw.end();
       },
     });

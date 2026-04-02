@@ -38,6 +38,15 @@ export interface GeneratedImage {
   alt?: string;
 }
 
+export interface ConversationSnapshot {
+  count: number;
+  lastText: string;
+  mainText: string;
+  imageKeys: string[];
+  imageNodeCount: number;
+  prompt?: string;
+}
+
 export interface CompletionResult {
   id: string;
   text: string;

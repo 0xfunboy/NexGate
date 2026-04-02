@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NEXUS CONTROL — API Docs</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="docs-body">
+    <div class="topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <svg class="brand-hex" viewBox="0 0 24 24" fill="none">
+            <path d="M12 2L21.39 7V17L12 22L2.61 17V7L12 2Z" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M12 6L18 9.5V16.5L12 20L6 16.5V9.5L12 6Z" fill="currentColor" opacity="0.25"/>
+          </svg>
+          <span class="brand-name">NEXUS</span>
+          <span class="brand-tag">API DOCS</span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <a class="topbar-btn topbar-link" href="/">Dashboard</a>
+      </div>
+    </div>
+
+    <main class="docs-shell">
+      <section class="docs-hero">
+        <h1>NEXUS CONTROL API</h1>
+        <p>Playwright-driven gateway over ChatGPT, Claude, Gemini, and Grok web sessions.</p>
+      </section>
+
+      <section class="docs-section">
+        <h2>Base URL</h2>
+        <pre><code>http://localhost:3001</code></pre>
+      </section>
+
+      <section class="docs-section">
+        <h2>Core Endpoints</h2>
+        <div class="docs-grid">
+          <article class="docs-card">
+            <h3>Health and provider state</h3>
+            <ul>
+              <li><code>GET /health</code> basic liveness and provider ids</li>
+              <li><code>GET /providers</code> provider config plus accounts</li>
+              <li><code>GET /providers/overview</code> provider status summary for the dashboard</li>
+              <li><code>GET /providers/:provider/status</code> detailed status for one provider</li>
+            </ul>
+          </article>
+          <article class="docs-card">
+            <h3>Session control</h3>
+            <ul>
+              <li><code>POST /providers/:provider/login</code> open or restore provider login in Playwright</li>
+              <li><code>POST /providers/:provider/reset</code> close current provider tab</li>
+              <li><code>POST /providers/:provider/accounts/rotate</code> rotate to the next account</li>
+              <li><code>POST /providers/:provider/accounts/reset-quota</code> clear exhausted flags</li>
+            </ul>
+          </article>
+          <article class="docs-card">
+            <h3>Prompt execution</h3>
+            <ul>
+              <li><code>POST /providers/:provider/prompt</code> synchronous prompt execution</li>
+              <li><code>POST /providers/:provider/stream</code> SSE token stream for one provider</li>
+              <li><code>POST /compare</code> synchronous multi-provider compare</li>
+              <li><code>POST /compare/stream</code> NDJSON multi-provider streaming compare</li>
+            </ul>
+          </article>
+          <article class="docs-card">
+            <h3>Audio</h3>
+            <ul>
+              <li><code>POST /providers/grok/audio</code> capture Grok read-aloud output</li>
+              <li><code>GET /providers/grok/audio/latest</code> retrieve the last captured audio</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="docs-section">
+        <h2>OpenAI-Compatible</h2>
+        <div class="docs-grid">
+          <article class="docs-card">
+            <h3><code>GET /v1/models</code></h3>
+            <p>Returns one synthetic model per provider, for example <code>gemini:frontend-default</code>.</p>
+            <p><code>GET /v1/models/:model</code> returns a single model object for SDKs that probe individual model ids.</p>
+          </article>
+          <article class="docs-card">
+            <h3><code>POST /v1/chat/completions</code></h3>
+            <p>Accepts OpenAI-style chat messages, including <code>developer</code> role and array content parts. Supports <code>stream: true</code> with SSE.</p>
+            <pre><code>{
+  "model": "chatgpt:frontend-default",
+  "messages": [
+    { "role": "developer", "content": "Answer in concise Italian." },
+    { "role": "user", "content": "Write a haiku about debugging" }
+  ],
+  "stream": false
+}</code></pre>
+          </article>
+          <article class="docs-card">
+            <h3><code>POST /v1/responses</code></h3>
+            <p>Accepts a string input or message array. <code>instructions</code> is mapped to a system message. Supports streaming with OpenAI Responses-style SSE events.</p>
+            <pre><code>{
+  "model": "gemini:frontend-default",
+  "instructions": "Answer like a senior engineer.",
+  "input": "Explain the adapter pattern",
+  "stream": true
+}</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="docs-section">
+        <h2>Ollama-Compatible</h2>
+        <div class="docs-grid">
+          <article class="docs-card">
+            <h3><code>POST /api/generate</code></h3>
+            <p>Generate-style endpoint with optional streaming.</p>
+          </article>
+          <article class="docs-card">
+            <h3><code>POST /api/chat</code></h3>
+            <p>Chat-style endpoint with message arrays and optional streaming.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="docs-section">
+        <h2>Notes</h2>
+        <ul class="docs-list">
+          <li>The gateway uses real consumer web sessions. Login and quota behavior come from the provider websites.</li>
+          <li>Extra fields such as <code>images</code> may be present on some responses when the provider generated media.</li>
+          <li>Chat and Responses payloads tolerate extra OpenAI SDK fields that this gateway ignores.</li>
+          <li>Usage numbers are estimated, not tokenizer-accurate.</li>
+          <li>Requests for the same provider are serialized to avoid Playwright input collisions.</li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
