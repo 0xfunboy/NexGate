@@ -59,6 +59,7 @@
             <h3>Prompt execution</h3>
             <ul>
               <li><code>POST /providers/:provider/prompt</code> synchronous prompt execution</li>
+              <li><code>POST /providers/:provider/prompt-with-media</code> prompt plus inline JSON attachments</li>
               <li><code>POST /providers/:provider/stream</code> SSE token stream for one provider</li>
               <li><code>POST /compare</code> synchronous multi-provider compare</li>
               <li><code>POST /compare/stream</code> NDJSON multi-provider streaming compare</li>
@@ -69,6 +70,8 @@
             <ul>
               <li><code>POST /providers/grok/audio</code> capture Grok read-aloud output</li>
               <li><code>GET /providers/grok/audio/latest</code> retrieve the last captured audio</li>
+              <li><code>POST /providers/gemini/video</code> generate and download Gemini video output</li>
+              <li><code>POST /providers/gemini/music</code> generate and download Gemini music outputs</li>
             </ul>
           </article>
         </div>
@@ -84,23 +87,37 @@
           </article>
           <article class="docs-card">
             <h3><code>POST /v1/chat/completions</code></h3>
-            <p>Accepts OpenAI-style chat messages, including <code>developer</code> role and array content parts. Supports <code>stream: true</code> with SSE.</p>
+            <p>Accepts OpenAI-style chat messages, including <code>developer</code> role, array content parts, and image/file parts mapped to Gemini uploads when the selected model is Gemini. Supports <code>stream: true</code> with SSE.</p>
             <pre><code>{
-  "model": "chatgpt:frontend-default",
+  "model": "gemini:frontend-default",
   "messages": [
     { "role": "developer", "content": "Answer in concise Italian." },
-    { "role": "user", "content": "Write a haiku about debugging" }
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Describe this image." },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } }
+      ]
+    }
   ],
   "stream": false
 }</code></pre>
           </article>
           <article class="docs-card">
             <h3><code>POST /v1/responses</code></h3>
-            <p>Accepts a string input or message array. <code>instructions</code> is mapped to a system message. Supports streaming with OpenAI Responses-style SSE events.</p>
+            <p>Accepts a string input or message array. <code>instructions</code> is mapped to a system message. <code>input_image</code> parts are materialized as Gemini uploads. Supports streaming with OpenAI Responses-style SSE events.</p>
             <pre><code>{
   "model": "gemini:frontend-default",
   "instructions": "Answer like a senior engineer.",
-  "input": "Explain the adapter pattern",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "input_text", "text": "What is in this image?" },
+        { "type": "input_image", "image_url": "data:image/jpeg;base64,..." }
+      ]
+    }
+  ],
   "stream": true
 }</code></pre>
           </article>
@@ -127,6 +144,7 @@
           <li>The gateway uses real consumer web sessions. Login and quota behavior come from the provider websites.</li>
           <li>Extra fields such as <code>images</code> may be present on some responses when the provider generated media.</li>
           <li>Chat and Responses payloads tolerate extra OpenAI SDK fields that this gateway ignores.</li>
+          <li>Inline media uploads currently map cleanly to Gemini. Other providers may reject attachments depending on their web UI flow.</li>
           <li>Usage numbers are estimated, not tokenizer-accurate.</li>
           <li>Requests for the same provider are serialized to avoid Playwright input collisions.</li>
         </ul>

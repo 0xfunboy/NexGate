@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import Fastify, { type FastifyReply } from "fastify";
@@ -11,7 +12,7 @@ import { loadGatewayConfig, loadProviderConfigs } from "./config.js";
 import { toUiError } from "./errors.js";
 import { FrontendGateway, setupNdjsonHeaders, setupSseHeaders, writeNdjson, writeOpenAiDone, writeSse } from "./gateway.js";
 import { ProviderRegistry } from "./providers/registry.js";
-import type { AccountConfig, ChatMessage, ChatRole, CompletionRequest, ProviderId } from "./types.js";
+import type { AccountConfig, ChatMessage, ChatRole, CompletionRequest, InputAttachment, ProviderId } from "./types.js";
 import { nowUnix, parseModelProvider } from "./utils.js";
 
 const providerSchema = z.enum(["chatgpt", "claude", "gemini", "grok"]);
@@ -24,6 +25,15 @@ const textPartSchema = z.object({
   type: z.string().optional(),
   text: z.string().optional(),
   input_text: z.string().optional(),
+  image_url: z.union([
+    z.string(),
+    z.object({ url: z.string() }).passthrough(),
+  ]).optional(),
+  file_url: z.string().optional(),
+  file_data: z.string().optional(),
+  data: z.string().optional(),
+  mime_type: z.string().optional(),
+  filename: z.string().optional(),
 }).passthrough();
 
 const openAiMessageSchema = z.object({
@@ -74,6 +84,26 @@ const compareRequestSchema = z.object({
   prompt: z.string().min(1),
 });
 
+const inlineAttachmentSchema = z.object({
+  name: z.string().optional(),
+  filename: z.string().optional(),
+  mimeType: z.string().optional(),
+  mime_type: z.string().optional(),
+  dataBase64: z.string().optional(),
+  data_base64: z.string().optional(),
+  url: z.string().optional(),
+  image_url: z.union([
+    z.string(),
+    z.object({ url: z.string() }).passthrough(),
+  ]).optional(),
+  file_url: z.string().optional(),
+}).passthrough();
+
+const providerPromptWithAttachmentsSchema = z.object({
+  prompt: z.string().min(1),
+  attachments: z.array(inlineAttachmentSchema).optional().default([]),
+});
+
 function resolveProvider(model: string, explicitProvider?: ProviderId): { provider: ProviderId; model: string } {
   const parsed = parseModelProvider(model);
   const provider = explicitProvider ?? parsed.provider ?? "chatgpt";
@@ -84,6 +114,7 @@ function toCompletionRequest(input: {
   provider?: ProviderId;
   model: string;
   messages: ChatMessage[];
+  attachments?: InputAttachment[];
   stream?: boolean;
 }): CompletionRequest {
   const resolved = resolveProvider(input.model, input.provider);
@@ -91,6 +122,7 @@ function toCompletionRequest(input: {
     provider: resolved.provider,
     model: resolved.model,
     messages: input.messages,
+    attachments: input.attachments,
     stream: input.stream,
   };
 }
@@ -122,6 +154,48 @@ function extractTextContent(content: string | Array<{ text?: string; input_text?
     .join("\n");
 }
 
+function extractAttachmentUrl(part: {
+  image_url?: string | { url: string };
+  file_url?: string;
+}): string | undefined {
+  if (typeof part.image_url === "string") return part.image_url;
+  if (part.image_url?.url) return part.image_url.url;
+  return part.file_url;
+}
+
+function extractAttachmentParts(
+  content: Array<{
+    type?: string;
+    image_url?: string | { url: string };
+    file_url?: string;
+    file_data?: string;
+    data?: string;
+    mime_type?: string;
+    filename?: string;
+  }>,
+): Array<{
+  url?: string;
+  data?: string;
+  mimeType?: string;
+  filename?: string;
+}> {
+  return content
+    .map((part) => {
+      const type = part.type ?? "";
+      const url = extractAttachmentUrl(part);
+      const data = part.file_data ?? part.data;
+      if (!url && !data) return null;
+      if (type && !["image_url", "input_image", "input_file", "file"].includes(type)) return null;
+      return {
+        url,
+        data,
+        mimeType: part.mime_type,
+        filename: part.filename,
+      };
+    })
+    .filter((value) => value !== null);
+}
+
 function toChatMessages(input: Array<{ role?: string; content?: string | Array<{ text?: string; input_text?: string }> | null }>): ChatMessage[] {
   return input
     .map((message) => ({
@@ -148,6 +222,134 @@ function toResponseMessages(
 
   messages.push(...toChatMessages(input));
   return messages;
+}
+
+function collectAttachmentsFromChatMessages(
+  input: Array<{ content?: string | Array<{
+    type?: string;
+    image_url?: string | { url: string };
+    file_url?: string;
+    file_data?: string;
+    data?: string;
+    mime_type?: string;
+    filename?: string;
+  }> | null }>,
+): Array<{ url?: string; data?: string; mimeType?: string; filename?: string }> {
+  return input.flatMap((message) => Array.isArray(message.content) ? extractAttachmentParts(message.content) : []);
+}
+
+function collectAttachmentsFromResponseInput(
+  input: string | Array<{ content: string | Array<{
+    type?: string;
+    image_url?: string | { url: string };
+    file_url?: string;
+    file_data?: string;
+    data?: string;
+    mime_type?: string;
+    filename?: string;
+  }> }>,
+): Array<{ url?: string; data?: string; mimeType?: string; filename?: string }> {
+  if (typeof input === "string") return [];
+  return input.flatMap((message) => Array.isArray(message.content) ? extractAttachmentParts(message.content) : []);
+}
+
+function mimeToExtension(mimeType?: string): string {
+  const normalized = (mimeType ?? "").toLowerCase();
+  if (normalized.includes("png")) return "png";
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) return "jpg";
+  if (normalized.includes("webp")) return "webp";
+  if (normalized.includes("gif")) return "gif";
+  if (normalized.includes("pdf")) return "pdf";
+  if (normalized.includes("mp3") || normalized.includes("mpeg")) return "mp3";
+  if (normalized.includes("wav")) return "wav";
+  if (normalized.includes("ogg")) return "ogg";
+  if (normalized.includes("mp4")) return "mp4";
+  if (normalized.includes("webm")) return "webm";
+  return "bin";
+}
+
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+/, "") || "attachment";
+}
+
+function parseDataUrl(value: string): { mimeType: string; buffer: Buffer } | null {
+  const match = value.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+  if (!match) return null;
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] || "";
+  return {
+    mimeType,
+    buffer: isBase64 ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload)),
+  };
+}
+
+async function materializeAttachments(
+  items: Array<{ url?: string; data?: string; mimeType?: string; filename?: string }>,
+): Promise<{ attachments: InputAttachment[]; cleanup: () => Promise<void> }> {
+  const dir = path.join(tmpdir(), "frontend-llm-gateway-uploads");
+  await mkdir(dir, { recursive: true });
+
+  const createdPaths: string[] = [];
+  const attachments: InputAttachment[] = [];
+
+  for (const item of items) {
+    let buffer: Buffer | null = null;
+    let mimeType = item.mimeType;
+    let filename = sanitizeFilename(item.filename || "");
+
+    if (item.data) {
+      const parsed = parseDataUrl(item.data);
+      if (parsed) {
+        buffer = parsed.buffer;
+        mimeType = mimeType ?? parsed.mimeType;
+      } else {
+        buffer = Buffer.from(item.data, "base64");
+      }
+    } else if (item.url) {
+      if (item.url.startsWith("data:")) {
+        const parsed = parseDataUrl(item.url);
+        if (parsed) {
+          buffer = parsed.buffer;
+          mimeType = mimeType ?? parsed.mimeType;
+        }
+      } else {
+        const response = await fetch(item.url);
+        if (!response.ok) {
+          throw new Error(`Download allegato fallito: ${response.status} ${response.statusText}`);
+        }
+        buffer = Buffer.from(await response.arrayBuffer());
+        mimeType = mimeType ?? response.headers.get("content-type") ?? undefined;
+        if (!filename) {
+          try {
+            filename = sanitizeFilename(path.basename(new URL(item.url).pathname) || "");
+          } catch {
+            filename = "";
+          }
+        }
+      }
+    }
+
+    if (!buffer) continue;
+
+    if (!filename) {
+      filename = `attachment.${mimeToExtension(mimeType)}`;
+    } else if (!filename.includes(".")) {
+      filename = `${filename}.${mimeToExtension(mimeType)}`;
+    }
+
+    const filePath = path.join(dir, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${filename}`);
+    await writeFile(filePath, buffer);
+    createdPaths.push(filePath);
+    attachments.push({ path: filePath, name: filename, mimeType });
+  }
+
+  return {
+    attachments,
+    cleanup: async () => {
+      await Promise.allSettled(createdPaths.map(async (filePath) => rm(filePath, { force: true })));
+    },
+  };
 }
 
 function estimateTokens(text: string): number {
@@ -388,6 +590,107 @@ export async function buildServer() {
     });
   });
 
+  app.post("/providers/:provider/prompt-with-media", async (request) => {
+    const params = z.object({ provider: providerSchema }).parse(request.params);
+    const body = providerPromptWithAttachmentsSchema.parse(request.body);
+    const prepared = await materializeAttachments(body.attachments.map((attachment) => ({
+      url: attachment.url
+        ?? attachment.file_url
+        ?? (typeof attachment.image_url === "string" ? attachment.image_url : attachment.image_url?.url),
+      data: attachment.dataBase64 ?? attachment.data_base64,
+      mimeType: attachment.mimeType ?? attachment.mime_type,
+      filename: attachment.name ?? attachment.filename,
+    })));
+
+    try {
+      return await gateway.complete({
+        provider: params.provider,
+        model: "frontend-default",
+        messages: [{ role: "user", content: body.prompt }],
+        attachments: prepared.attachments,
+      });
+    } finally {
+      await prepared.cleanup();
+    }
+  });
+
+  app.post("/providers/gemini/video", async (request) => {
+    const body = providerPromptWithAttachmentsSchema.parse(request.body);
+    const prepared = await materializeAttachments(body.attachments.map((attachment) => ({
+      url: attachment.url
+        ?? attachment.file_url
+        ?? (typeof attachment.image_url === "string" ? attachment.image_url : attachment.image_url?.url),
+      data: attachment.dataBase64 ?? attachment.data_base64,
+      mimeType: attachment.mimeType ?? attachment.mime_type,
+      filename: attachment.name ?? attachment.filename,
+    })));
+
+    try {
+      const result = await gateway.generateVideo({
+        provider: "gemini",
+        model: "frontend-default",
+        messages: [{ role: "user", content: body.prompt }],
+        attachments: prepared.attachments,
+      });
+
+      return {
+        id: result.id,
+        text: result.text,
+        media: result.media
+          ? {
+            filename: result.media.filename,
+            mimeType: result.media.mimeType,
+            dataBase64: result.media.data.toString("base64"),
+          }
+          : null,
+      };
+    } finally {
+      await prepared.cleanup();
+    }
+  });
+
+  app.post("/providers/gemini/music", async (request) => {
+    const body = providerPromptWithAttachmentsSchema.parse(request.body);
+    const prepared = await materializeAttachments(body.attachments.map((attachment) => ({
+      url: attachment.url
+        ?? attachment.file_url
+        ?? (typeof attachment.image_url === "string" ? attachment.image_url : attachment.image_url?.url),
+      data: attachment.dataBase64 ?? attachment.data_base64,
+      mimeType: attachment.mimeType ?? attachment.mime_type,
+      filename: attachment.name ?? attachment.filename,
+    })));
+
+    try {
+      const result = await gateway.generateMusic({
+        provider: "gemini",
+        model: "frontend-default",
+        messages: [{ role: "user", content: body.prompt }],
+        attachments: prepared.attachments,
+      });
+
+      return {
+        id: result.id,
+        text: result.text,
+        video: result.downloads.video
+          ? {
+            filename: result.downloads.video.filename,
+            mimeType: result.downloads.video.mimeType,
+            dataBase64: result.downloads.video.data.toString("base64"),
+          }
+          : null,
+        audio: result.downloads.audio
+          ? {
+            filename: result.downloads.audio.filename,
+            mimeType: result.downloads.audio.mimeType,
+            dataBase64: result.downloads.audio.data.toString("base64"),
+          }
+          : null,
+      };
+    } finally {
+      await prepared.cleanup();
+    }
+  });
+
   app.post("/providers/:provider/audio", async (request) => {
     const params = z.object({ provider: providerSchema }).parse(request.params);
     const audio = await gateway.captureAudio(params.provider);
@@ -501,70 +804,76 @@ export async function buildServer() {
   app.post("/v1/chat/completions", async (request, reply) => {
     const body = openAiRequestSchema.parse(request.body);
     const messages = toChatMessages(body.messages);
+    const prepared = await materializeAttachments(collectAttachmentsFromChatMessages(body.messages));
     const completionRequest = toCompletionRequest({
       provider: body.provider,
       model: body.model,
       messages,
+      attachments: prepared.attachments,
       stream: body.stream,
     });
 
-    if (!body.stream) {
-      const result = await gateway.complete(completionRequest);
-      return {
-        id: `chatcmpl_${result.id}`,
-        object: "chat.completion",
-        created: nowUnix(),
-        model: `${completionRequest.provider}:${completionRequest.model}`,
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: result.text },
-            finish_reason: "stop",
-          },
-        ],
-        images: result.images,
-        usage: buildUsage(messages, result.text),
-      };
-    }
+    try {
+      if (!body.stream) {
+        const result = await gateway.complete(completionRequest);
+        return {
+          id: `chatcmpl_${result.id}`,
+          object: "chat.completion",
+          created: nowUnix(),
+          model: `${completionRequest.provider}:${completionRequest.model}`,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: result.text },
+              finish_reason: "stop",
+            },
+          ],
+          images: result.images,
+          usage: buildUsage(messages, result.text),
+        };
+      }
 
-    setupSseHeaders(reply);
-    const completionId = `chatcmpl_${Date.now()}`;
-    let sentRoleChunk = false;
+      setupSseHeaders(reply);
+      const completionId = `chatcmpl_${Date.now()}`;
+      let sentRoleChunk = false;
 
-    await gateway.stream(completionRequest, {
-      onToken: async (token) => {
-        if (!sentRoleChunk) {
-          sentRoleChunk = true;
+      await gateway.stream(completionRequest, {
+        onToken: async (token) => {
+          if (!sentRoleChunk) {
+            sentRoleChunk = true;
+            await writeSse(reply, {
+              id: completionId,
+              object: "chat.completion.chunk",
+              created: nowUnix(),
+              model: `${completionRequest.provider}:${completionRequest.model}`,
+              choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+            });
+          }
           await writeSse(reply, {
             id: completionId,
             object: "chat.completion.chunk",
             created: nowUnix(),
             model: `${completionRequest.provider}:${completionRequest.model}`,
-            choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+            choices: [{ index: 0, delta: { content: token }, finish_reason: null }],
           });
-        }
-        await writeSse(reply, {
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: nowUnix(),
-          model: `${completionRequest.provider}:${completionRequest.model}`,
-          choices: [{ index: 0, delta: { content: token }, finish_reason: null }],
-        });
-      },
-      onComplete: async () => {
-        await writeSse(reply, {
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: nowUnix(),
-          model: `${completionRequest.provider}:${completionRequest.model}`,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
-        await writeOpenAiDone(reply);
-        reply.raw.end();
-      },
-    });
+        },
+        onComplete: async () => {
+          await writeSse(reply, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: nowUnix(),
+            model: `${completionRequest.provider}:${completionRequest.model}`,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          });
+          await writeOpenAiDone(reply);
+          reply.raw.end();
+        },
+      });
 
-    return reply;
+      return reply;
+    } finally {
+      await prepared.cleanup();
+    }
   });
 
   app.get("/v1/models", async () => {
@@ -607,77 +916,83 @@ export async function buildServer() {
   app.post("/v1/responses", async (request, reply) => {
     const body = responsesRequestSchema.parse(request.body);
     const messages = toResponseMessages(body.input, body.instructions);
+    const prepared = await materializeAttachments(collectAttachmentsFromResponseInput(body.input));
     const completionRequest = toCompletionRequest({
       provider: body.provider,
       model: body.model,
       messages,
+      attachments: prepared.attachments,
       stream: body.stream,
     });
 
-    if (!body.stream) {
-      const result = await gateway.complete(completionRequest);
-      return toOpenAiResponseObject({
-        id: result.id,
-        model: `${completionRequest.provider}:${completionRequest.model}`,
-        text: result.text,
-        images: result.images,
-        inputMessages: messages,
+    try {
+      if (!body.stream) {
+        const result = await gateway.complete(completionRequest);
+        return toOpenAiResponseObject({
+          id: result.id,
+          model: `${completionRequest.provider}:${completionRequest.model}`,
+          text: result.text,
+          images: result.images,
+          inputMessages: messages,
+        });
+      }
+
+      setupSseHeaders(reply);
+      const responseId = `resp_${Date.now()}`;
+      const model = `${completionRequest.provider}:${completionRequest.model}`;
+      const messageId = `msg_${responseId}`;
+      let streamedText = "";
+
+      await writeSse(reply, {
+        type: "response.created",
+        response: {
+          id: responseId,
+          object: "response",
+          created_at: nowUnix(),
+          status: "in_progress",
+          model,
+        },
       });
+
+      await gateway.stream(completionRequest, {
+        onToken: async (token) => {
+          streamedText += token;
+          await writeSse(reply, {
+            type: "response.output_text.delta",
+            response_id: responseId,
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            delta: token,
+          });
+        },
+        onComplete: async ({ text, images }) => {
+          await writeSse(reply, {
+            type: "response.output_text.done",
+            response_id: responseId,
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            text,
+          });
+          await writeSse(reply, {
+            type: "response.completed",
+            response: toOpenAiResponseObject({
+              id: responseId,
+              model,
+              text: text || streamedText,
+              images,
+              inputMessages: messages,
+            }),
+          });
+          reply.raw.end();
+        },
+      });
+
+      return reply;
+    } finally {
+      await prepared.cleanup();
     }
-
-    setupSseHeaders(reply);
-    const responseId = `resp_${Date.now()}`;
-    const model = `${completionRequest.provider}:${completionRequest.model}`;
-    const messageId = `msg_${responseId}`;
-    let streamedText = "";
-
-    await writeSse(reply, {
-      type: "response.created",
-      response: {
-        id: responseId,
-        object: "response",
-        created_at: nowUnix(),
-        status: "in_progress",
-        model,
-      },
-    });
-
-    await gateway.stream(completionRequest, {
-      onToken: async (token) => {
-        streamedText += token;
-        await writeSse(reply, {
-          type: "response.output_text.delta",
-          response_id: responseId,
-          item_id: messageId,
-          output_index: 0,
-          content_index: 0,
-          delta: token,
-        });
-      },
-      onComplete: async ({ text, images }) => {
-        await writeSse(reply, {
-          type: "response.output_text.done",
-          response_id: responseId,
-          item_id: messageId,
-          output_index: 0,
-          content_index: 0,
-          text,
-        });
-        await writeSse(reply, {
-          type: "response.completed",
-          response: toOpenAiResponseObject({
-            id: responseId,
-            model,
-            text: text || streamedText,
-            images,
-            inputMessages: messages,
-          }),
-        });
-        reply.raw.end();
-      },
-    });
-
-    return reply;
   });
 
   app.post("/api/generate", async (request, reply) => {

@@ -1,6 +1,14 @@
 import type { Locator, Page, Response } from "playwright";
 
-import type { ConversationSnapshot, GatewayConfig, GeneratedImage, ProviderConfig, ProviderId } from "../types.js";
+import type {
+  ConversationSnapshot,
+  GatewayConfig,
+  GeneratedImage,
+  GeneratedMedia,
+  GeneratedMusicDownloads,
+  ProviderConfig,
+  ProviderId,
+} from "../types.js";
 import { sleep } from "../utils.js";
 
 /** Quota-exhaustion message patterns per provider. */
@@ -195,14 +203,17 @@ export class GenericFrontendProvider {
   async *streamResponse(
     page: Page,
     baseline: ConversationSnapshot,
+    overrides: { maxDurationMs?: number; firstChunkTimeoutMs?: number } = {},
   ): AsyncGenerator<string, { text: string; images: GeneratedImage[] }> {
+    const maxDurationMs = overrides.maxDurationMs ?? this.gatewayConfig.streamMaxDurationMs;
+    const firstChunkTimeoutMs = overrides.firstChunkTimeoutMs ?? this.gatewayConfig.streamFirstChunkTimeoutMs;
     const startedAt = Date.now();
     let previous = "";
     let stableTicks = 0;
     let firstUsefulSignalSeen = false;
 
     while (stableTicks < this.gatewayConfig.streamStableTicks) {
-      if (Date.now() - startedAt > this.gatewayConfig.streamMaxDurationMs) {
+      if (Date.now() - startedAt > maxDurationMs) {
         throw new Error(`Provider ${this.config.id} ha superato il timeout massimo di risposta.`);
       }
 
@@ -228,7 +239,7 @@ export class GenericFrontendProvider {
         stableTicks = busy && !canSettleWhileBusy ? 0 : stableTicks + 1;
       }
 
-      if (!firstUsefulSignalSeen && Date.now() - startedAt > this.gatewayConfig.streamFirstChunkTimeoutMs) {
+      if (!firstUsefulSignalSeen && Date.now() - startedAt > firstChunkTimeoutMs) {
         throw new Error(`Provider ${this.config.id} non ha iniziato a rispondere entro il timeout iniziale.`);
       }
 
@@ -282,6 +293,172 @@ export class GenericFrontendProvider {
     }
 
     throw new Error("Grok non ha esposto un audio leggibile dopo il click su read aloud.");
+  }
+
+  async uploadFile(page: Page, filePath: string): Promise<void> {
+    if (this.config.id !== "gemini") {
+      throw new Error(`Provider ${this.config.id} non supporta upload file via gateway.`);
+    }
+
+    await this.ensureReady(page);
+
+    const attachedDirectly = await this.trySetInputFiles(page, filePath);
+    if (!attachedDirectly) {
+      const attachmentButtons = await this.findAttachmentButtons(page);
+      let attached = false;
+
+      for (const button of attachmentButtons) {
+        await button.click({ force: true }).catch(() => undefined);
+        await sleep(500);
+
+        if (await this.trySetInputFiles(page, filePath)) {
+          attached = true;
+          break;
+        }
+
+        const uploadTargets = [
+          page.locator('[data-test-id="local-images-files-uploader-button"]').first(),
+          page.locator('button[data-test-id="local-images-files-uploader-button"]').first(),
+          page.locator('button[aria-label*="Upload files"]').first(),
+          page.locator('button[role="menuitem"]').filter({
+            has: page.locator('[data-test-id="local-images-files-uploader-icon"]'),
+          }).first(),
+          page.locator('button.mat-mdc-menu-item, button[mat-menu-item]').filter({
+            hasText: /^upload files$/i,
+          }).first(),
+          page.locator('button.mat-mdc-menu-item, button[mat-menu-item]').filter({
+            hasText: /upload files|upload|file|files|computer|device/i,
+          }).first(),
+          page.locator('div[role="menuitem"], button[role="menuitem"]').filter({
+            hasText: /upload files|upload|file|files|computer|device/i,
+          }).first(),
+        ];
+
+        for (const target of uploadTargets) {
+          if (!(await target.isVisible({ timeout: 1_500 }).catch(() => false))) continue;
+          if (await this.tryChooseFiles(page, target, filePath)) {
+            attached = true;
+            break;
+          }
+          if (await this.trySetInputFiles(page, filePath)) {
+            attached = true;
+            break;
+          }
+        }
+
+        if (attached) break;
+
+        await page.keyboard.press("Escape").catch(() => undefined);
+        await sleep(200);
+      }
+
+      if (!attached) {
+        throw new Error("Upload file Gemini non disponibile: input file non trovato.");
+      }
+    }
+
+    await this.waitForAttachmentPreview(page);
+  }
+
+  async downloadGeneratedMusic(page: Page, timeoutMs = 120_000): Promise<GeneratedMusicDownloads> {
+    if (this.config.id !== "gemini") {
+      throw new Error(`Provider ${this.config.id} non supporta music download via gateway.`);
+    }
+
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const video = await this.downloadLastResponseMenuMedia(page, {
+        icon: "movie",
+        label: "Video",
+        filenameFallback: "generated_music_video.mp4",
+      });
+      const audio = await this.downloadLastResponseMenuMedia(page, {
+        icon: "music_note",
+        label: "Audio only",
+        filenameFallback: "generated_music_audio.mp3",
+      });
+
+      if (video || audio) {
+        return { video, audio };
+      }
+
+      await sleep(2_000);
+    }
+
+    return { video: null, audio: null };
+  }
+
+  async downloadGeneratedMedia(page: Page, timeoutMs = 120_000): Promise<GeneratedMedia | null> {
+    if (this.config.id !== "gemini") {
+      throw new Error(`Provider ${this.config.id} non supporta generated media via gateway.`);
+    }
+
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const media = await page.evaluate(async (): Promise<{ data: string; mimeType: string; filename: string } | null> => {
+        type MediaNodeLike = {
+          src?: string;
+          querySelector: (selector: string) => MediaNodeLike | null;
+        };
+        type DocLike = {
+          querySelectorAll: (selector: string) => ArrayLike<MediaNodeLike>;
+        };
+
+        const doc = (globalThis as { document?: DocLike }).document;
+        if (!doc) return null;
+
+        const responses = Array.from(doc.querySelectorAll("response-container, message-content"));
+        if (responses.length === 0) return null;
+        const last = responses[responses.length - 1];
+
+        const audio = last.querySelector("audio");
+        const audioSource = last.querySelector("audio source");
+        const video = last.querySelector("video");
+        const videoSource = last.querySelector("video source");
+        const src = audio?.src || audioSource?.src || video?.src || videoSource?.src || "";
+        if (!src) return null;
+
+        try {
+          const response = await fetch(src);
+          const blob = await response.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+          const bytes = new Uint8Array(arrayBuffer);
+          let binary = "";
+          for (let index = 0; index < bytes.length; index += 1) {
+            binary += String.fromCharCode(bytes[index]);
+          }
+
+          const mimeType = blob.type || "application/octet-stream";
+          const filename = mimeType.startsWith("audio/") ? "generated.mp3" : "generated.mp4";
+          return { data: btoa(binary), mimeType, filename };
+        } catch {
+          return null;
+        }
+      }).catch(() => null);
+
+      if (media) {
+        return {
+          data: Buffer.from(media.data, "base64"),
+          mimeType: media.mimeType,
+          filename: media.filename,
+        };
+      }
+
+      const lastResponse = page.locator("response-container").last();
+      const downloadButton = lastResponse.locator('button:has(mat-icon[fonticon="download"])').first();
+      if (await downloadButton.isVisible().catch(() => false)) {
+        const file = await this.triggerDownloadWithMeta(page, downloadButton, "generated_media");
+        if (file) {
+          return file;
+        }
+      }
+
+      await sleep(2_000);
+    }
+
+    return null;
   }
 
   private async readLastMessage(page: Page, baseline: ConversationSnapshot): Promise<string> {
@@ -1409,6 +1586,202 @@ export class GenericFrontendProvider {
 
       return Promise.all(unique.map(async (img) => ({ src: await toDisplaySrc(img.src), alt: img.alt })));
     }).catch(() => []);
+  }
+
+  private async trySetInputFiles(page: Page, filePath: string): Promise<boolean> {
+    const candidates = [
+      page.locator('input[type="file"]').last(),
+      page.locator('input[type="file"][accept]').last(),
+      page.locator('input[type="file"][multiple]').last(),
+    ];
+
+    for (const input of candidates) {
+      if ((await input.count().catch(() => 0)) === 0) continue;
+      try {
+        await input.setInputFiles(filePath, { timeout: 5_000 });
+        return true;
+      } catch {
+        continue;
+      }
+    }
+
+    return false;
+  }
+
+  private async findAttachmentButtons(page: Page): Promise<Locator[]> {
+    const selectors = [
+      'button[aria-label*="Add"]',
+      'button[aria-label*="Upload"]',
+      'button[aria-label*="Attach"]',
+      'button[aria-label*="photo" i]',
+      'button[aria-label*="file" i]',
+      'button[aria-label*="image" i]',
+      'button[mattooltip*="Add"]',
+      'button[mattooltip*="Upload"]',
+      'button[mattooltip*="Attach"]',
+      'button:has(mat-icon[fonticon="add"])',
+      'button:has(mat-icon[fonticon="attach_file"])',
+      'button:has(mat-icon[fonticon="upload_file"])',
+      'button:has(mat-icon[fonticon="image"])',
+    ];
+
+    const buttons: Locator[] = [];
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let index = 0; index < count; index += 1) {
+        const button = locator.nth(index);
+        if (await button.isVisible({ timeout: 500 }).catch(() => false)) {
+          buttons.push(button);
+        }
+      }
+    }
+
+    const textMatches = page.locator("button").filter({
+      hasText: /add files|upload files|photos and files|upload|attach|image|photo/i,
+    });
+    const extraCount = await textMatches.count().catch(() => 0);
+    for (let index = 0; index < extraCount; index += 1) {
+      const button = textMatches.nth(index);
+      if (await button.isVisible({ timeout: 500 }).catch(() => false)) {
+        buttons.push(button);
+      }
+    }
+
+    return buttons;
+  }
+
+  private async tryChooseFiles(page: Page, target: Locator, filePath: string): Promise<boolean> {
+    try {
+      const [chooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 5_000 }),
+        target.click({ force: true }),
+      ]);
+      await chooser.setFiles(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async waitForAttachmentPreview(page: Page, timeoutMs = 15_000): Promise<void> {
+    const previewSelectors = [
+      ".attachment-container",
+      '[data-test-id*="attachment"]',
+      '[aria-label*="Remove attachment"]',
+      'img[src^="blob:"]',
+      'video[src^="blob:"]',
+      'audio[src^="blob:"]',
+      'button[aria-label*="Remove file"]',
+    ];
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      for (const selector of previewSelectors) {
+        const locator = page.locator(selector).last();
+        if (await locator.isVisible().catch(() => false)) {
+          return;
+        }
+      }
+      await sleep(300);
+    }
+
+    await sleep(1_000);
+  }
+
+  private async downloadLastResponseMenuMedia(
+    page: Page,
+    option: { icon: string; label: string; filenameFallback: string },
+  ): Promise<GeneratedMedia | null> {
+    const lastResponse = page.locator("response-container").last();
+    if (!(await lastResponse.isVisible().catch(() => false))) return null;
+
+    await lastResponse.scrollIntoViewIfNeeded().catch(() => undefined);
+    await lastResponse.hover({ force: true }).catch(() => undefined);
+    await sleep(400);
+
+    const downloadButton = await this.findLastResponseDownloadButton(page, lastResponse);
+    if (!downloadButton) return null;
+
+    await downloadButton.click({ force: true }).catch(() => undefined);
+    await sleep(500);
+
+    const optionButton = this.findMenuOption(page, option.icon, option.label);
+    if (!(await optionButton.isVisible({ timeout: 3_000 }).catch(() => false))) {
+      await page.keyboard.press("Escape").catch(() => undefined);
+      return null;
+    }
+
+    const download = await this.triggerDownloadWithMeta(page, optionButton, option.filenameFallback);
+    await page.keyboard.press("Escape").catch(() => undefined);
+    return download;
+  }
+
+  private async findLastResponseDownloadButton(page: Page, lastResponse: Locator): Promise<Locator | null> {
+    const candidates = [
+      lastResponse.locator('button:has(mat-icon[fonticon="download"])').first(),
+      lastResponse.locator('.button-icon-wrapper:has(mat-icon[fonticon="download"])').first(),
+      page.locator('button:has(mat-icon[fonticon="download"])').last(),
+      page.locator('.button-icon-wrapper:has(mat-icon[fonticon="download"])').last(),
+    ];
+
+    for (const candidate of candidates) {
+      if (await candidate.isVisible().catch(() => false)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  private findMenuOption(page: Page, icon: string, label: string): Locator {
+    const labelPattern = new RegExp(this.escapeRegex(label), "i");
+    return page.locator("button.mat-mdc-menu-item, button[mat-menu-item]").filter({
+      has: page.locator(`mat-icon[fonticon="${icon}"]`),
+      hasText: labelPattern,
+    }).first();
+  }
+
+  private async triggerDownloadWithMeta(
+    page: Page,
+    locator: Locator,
+    filenameFallback: string,
+  ): Promise<GeneratedMedia | null> {
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: 20_000 }),
+        locator.click({ force: true }),
+      ]);
+      const filePath = await download.path();
+      if (!filePath) {
+        return null;
+      }
+      const { readFile } = await import("node:fs/promises");
+      const filename = download.suggestedFilename() || filenameFallback;
+      return {
+        data: await readFile(filePath),
+        filename,
+        mimeType: this.inferMimeType(filename),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private inferMimeType(filename: string): string {
+    const normalized = filename.toLowerCase();
+    if (normalized.endsWith(".mp3")) return "audio/mpeg";
+    if (normalized.endsWith(".wav")) return "audio/wav";
+    if (normalized.endsWith(".ogg")) return "audio/ogg";
+    if (normalized.endsWith(".m4a")) return "audio/mp4";
+    if (normalized.endsWith(".mp4")) return "video/mp4";
+    if (normalized.endsWith(".mov")) return "video/quicktime";
+    if (normalized.endsWith(".webm")) return "video/webm";
+    return "application/octet-stream";
+  }
+
+  private escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   private async finalizeStreamedMessage(

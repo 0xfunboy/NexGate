@@ -38,6 +38,23 @@ export interface GeneratedImage {
   alt?: string;
 }
 
+export interface InputAttachment {
+  path: string;
+  name: string;
+  mimeType?: string;
+}
+
+export interface GeneratedMedia {
+  data: Buffer;
+  mimeType: string;
+  filename: string;
+}
+
+export interface GeneratedMusicDownloads {
+  video: GeneratedMedia | null;
+  audio: GeneratedMedia | null;
+}
+
 export interface ConversationSnapshot {
   count: number;
   lastText: string;
@@ -57,6 +74,7 @@ export interface CompletionRequest {
   provider: ProviderId;
   model: string;
   messages: ChatMessage[];
+  attachments?: InputAttachment[];
   stream?: boolean;
 }
 

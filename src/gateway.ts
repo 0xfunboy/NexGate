@@ -4,7 +4,15 @@ import { AccountManager } from "./accounts.js";
 import { SessionManager } from "./browser/session-manager.js";
 import { QuotaExhaustedError } from "./errors.js";
 import { ProviderRegistry } from "./providers/registry.js";
-import type { CompletionRequest, CompletionResult, GatewayConfig, GeneratedImage, ProviderId } from "./types.js";
+import type {
+  CompletionRequest,
+  CompletionResult,
+  GatewayConfig,
+  GeneratedImage,
+  GeneratedMedia,
+  GeneratedMusicDownloads,
+  ProviderId,
+} from "./types.js";
 import { randomId, toPrompt } from "./utils.js";
 
 export class FrontendGateway {
@@ -178,6 +186,11 @@ export class FrontendGateway {
         const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
         const prompt = toPrompt(request.messages);
         await provider.ensureConversationNotFull(page);
+        if (request.attachments?.length) {
+          for (const attachment of request.attachments) {
+            await provider.uploadFile(page, attachment.path);
+          }
+        }
         const baseline = await provider.snapshotConversation(page);
         await provider.sendPrompt(page, prompt);
 
@@ -222,6 +235,11 @@ export class FrontendGateway {
         const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
         const prompt = toPrompt(request.messages);
         await provider.ensureConversationNotFull(page);
+        if (request.attachments?.length) {
+          for (const attachment of request.attachments) {
+            await provider.uploadFile(page, attachment.path);
+          }
+        }
         const baseline = await provider.snapshotConversation(page);
         await provider.sendPrompt(page, prompt);
 
@@ -268,6 +286,66 @@ export class FrontendGateway {
       const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
       const audio = await provider.captureReadAloud(page);
       return { provider: providerId, ...audio };
+    });
+  }
+
+  async generateVideo(request: CompletionRequest): Promise<{ id: string; text: string; media: GeneratedMedia | null }> {
+    return this.withProviderLock(request.provider, async () => {
+      const providerId = request.provider;
+      const provider = this.registry.get(providerId);
+      const profilePath = this.accounts.getActiveProfilePath(providerId);
+      const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
+      const prompt = toPrompt(request.messages);
+
+      await provider.ensureConversationNotFull(page);
+      if (request.attachments?.length) {
+        for (const attachment of request.attachments) {
+          await provider.uploadFile(page, attachment.path);
+        }
+      }
+
+      const baseline = await provider.snapshotConversation(page);
+      await provider.sendPrompt(page, prompt);
+
+      const { finalText } = await this.collectProviderStream(
+        provider.streamResponse(page, { ...baseline, prompt }, {
+          maxDurationMs: this.config.streamMaxDurationMs * 5,
+          firstChunkTimeoutMs: this.config.streamFirstChunkTimeoutMs * 3,
+        }),
+      );
+
+      const media = await provider.downloadGeneratedMedia(page, 180_000);
+      return { id: randomId("media"), text: finalText.trim(), media };
+    });
+  }
+
+  async generateMusic(request: CompletionRequest): Promise<{ id: string; text: string; downloads: GeneratedMusicDownloads }> {
+    return this.withProviderLock(request.provider, async () => {
+      const providerId = request.provider;
+      const provider = this.registry.get(providerId);
+      const profilePath = this.accounts.getActiveProfilePath(providerId);
+      const { page } = await this.sessions.getOrCreate(provider.config, profilePath);
+      const prompt = toPrompt(request.messages);
+
+      await provider.ensureConversationNotFull(page);
+      if (request.attachments?.length) {
+        for (const attachment of request.attachments) {
+          await provider.uploadFile(page, attachment.path);
+        }
+      }
+
+      const baseline = await provider.snapshotConversation(page);
+      await provider.sendPrompt(page, prompt);
+
+      const { finalText } = await this.collectProviderStream(
+        provider.streamResponse(page, { ...baseline, prompt }, {
+          maxDurationMs: this.config.streamMaxDurationMs * 3,
+          firstChunkTimeoutMs: this.config.streamFirstChunkTimeoutMs * 2,
+        }),
+      );
+
+      const downloads = await provider.downloadGeneratedMusic(page, 90_000);
+      return { id: randomId("music"), text: finalText.trim(), downloads };
     });
   }
 
