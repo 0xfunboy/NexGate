@@ -1,3 +1,11 @@
+<div align="center">
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=160&section=header&text=NexGate&fontSize=60&fontColor=fff&animation=fadeIn&fontAlignY=38&desc=A%20local%20proxy%20that%20routes%20your%20requests%20to%20ChatGPT%2C%20Claude%2C%20Gemini%2C%20and%20Gro...&descAlignY=60&descSize=14" width="100%"/>
+
+<img src="https://skillicons.dev/icons?i=ts,js,css,html,bash,nodejs&theme=dark" alt="Tech stack"/>
+
+</div>
+
 # NEXUS CONTROL
 
 NEXUS CONTROL is a local Playwright-driven gateway that operates consumer LLM web frontends such as ChatGPT, Claude, Gemini, and Grok, then exposes them through:
