@@ -412,3 +412,7 @@ accounts.config.json
 ## Legal / Terms
 
 You are automating consumer web frontends. Make sure your usage complies with the terms of service, rate limits, and account policies of each provider.
+
+## Licensing
+
+Licensing scope and preserved third-party permissions are documented in [LICENSING.md](LICENSING.md). The [0xfunboy Non-Commercial License](LICENSE.md) covers eligible original material only.
